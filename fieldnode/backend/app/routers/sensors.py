@@ -48,24 +48,68 @@ async def ingest_reading(
     # Device heartbeat
     device.last_seen = datetime.utcnow()
 
-    # If ESP32 reports current pump state, update Device
-    if pump_is_on is not None:
-        device.pump_running = bool(pump_is_on)
+    # ---------------------------------------------------------
+    # PHYSICAL PUMP STATE
+    # ---------------------------------------------------------
 
-    # If ESP32 reports the source of the pump command,
-    # keep it on the Device model if that field exists.
+    # Track whether the physical pump state actually changed.
+    pump_state_changed = False
+
+    if pump_is_on is not None:
+
+        new_state = bool(pump_is_on)
+
+        if device.pump_running != new_state:
+            device.pump_running = new_state
+            pump_state_changed = True
+
+    # ---------------------------------------------------------
+    # PUMP SOURCE
+    # ---------------------------------------------------------
+
     if pump_source is not None:
+
         if hasattr(device, "pending_command_source"):
             device.pending_command_source = pump_source
+
+    # ---------------------------------------------------------
+    # SAVE READING
+    # ---------------------------------------------------------
 
     db.add(reading)
     db.commit()
     db.refresh(reading)
 
-    # Notifications
-    maybe_notify_from_reading(db, device, reading)
+    # ---------------------------------------------------------
+    # PHYSICAL PUMP STATE BROADCAST
+    # ---------------------------------------------------------
 
-    # WebSocket update
+    # If physical pump state changed, broadcast immediately.
+    if pump_state_changed:
+
+        await manager.broadcast(
+            device.zone_id,
+            {
+                "event": "pump_state",
+                "pump_running": device.pump_running,
+                "source": pump_source or "telemetry",
+            },
+        )
+
+    # ---------------------------------------------------------
+    # NOTIFICATIONS
+    # ---------------------------------------------------------
+
+    maybe_notify_from_reading(
+        db,
+        device,
+        reading,
+    )
+
+    # ---------------------------------------------------------
+    # WEBSOCKET READING UPDATE
+    # ---------------------------------------------------------
+
     await manager.broadcast(
         device.zone_id,
         {
@@ -75,7 +119,9 @@ async def ingest_reading(
             "temperature": reading.temperature,
             "humidity": reading.humidity,
             "light_level": reading.light_level,
-            "sunlight_pct": sunlight_percent(reading.light_level),
+            "sunlight_pct": sunlight_percent(
+                reading.light_level
+            ),
             "rain_detected": reading.rain_detected,
             "rain_intensity": reading.rain_intensity,
             "pump_is_on": pump_is_on,
@@ -97,11 +143,21 @@ def get_zone_readings(
     db: Session = Depends(get_db),
     user: models.User = Depends(get_current_user),
 ):
-    zone = get_owned_zone_or_404(db, zone_id, user)
+    zone = get_owned_zone_or_404(
+        db,
+        zone_id,
+        user,
+    )
 
-    device_ids = [d.id for d in zone.devices]
+    device_ids = [
+        d.id
+        for d in zone.devices
+    ]
 
-    since = datetime.utcnow() - timedelta(hours=hours)
+    since = (
+        datetime.utcnow()
+        - timedelta(hours=hours)
+    )
 
     readings = (
         db.query(models.SensorReading)
@@ -109,7 +165,9 @@ def get_zone_readings(
             models.SensorReading.device_id.in_(device_ids),
             models.SensorReading.timestamp >= since,
         )
-        .order_by(models.SensorReading.timestamp.asc())
+        .order_by(
+            models.SensorReading.timestamp.asc()
+        )
         .all()
     )
 
@@ -125,14 +183,25 @@ def get_latest_reading(
     db: Session = Depends(get_db),
     user: models.User = Depends(get_current_user),
 ):
-    zone = get_owned_zone_or_404(db, zone_id, user)
+    zone = get_owned_zone_or_404(
+        db,
+        zone_id,
+        user,
+    )
 
-    device_ids = [d.id for d in zone.devices]
+    device_ids = [
+        d.id
+        for d in zone.devices
+    ]
 
     reading = (
         db.query(models.SensorReading)
-        .filter(models.SensorReading.device_id.in_(device_ids))
-        .order_by(models.SensorReading.timestamp.desc())
+        .filter(
+            models.SensorReading.device_id.in_(device_ids)
+        )
+        .order_by(
+            models.SensorReading.timestamp.desc()
+        )
         .first()
     )
 

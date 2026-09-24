@@ -906,11 +906,13 @@ export default function Home() {
                       <small>seconds (max 300)</small>
                     </label>
                   )}
-                  <button
-                    className={`pump-action ${pumpRunning ? "stop" : ""}`}
-                    onClick={togglePump}
-                    disabled={autoMode || pumpBusy || !device || isHardwareOffline}
-                  >
+                  // In fieldnode/frontend/client/src/pages/Home.tsx (line 924)
+
+                    <button
+                      className={`pump-action ${pumpRunning ? "stop" : ""}`}
+                      onClick={togglePump}
+                      disabled={(!pumpRunning && autoMode) || pumpBusy || !device || isHardwareOffline}
+                    >
                     {isHardwareOffline ? (
                       <>
                         <AlertTriangle size={16} /> Hardware Offline

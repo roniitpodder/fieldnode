@@ -49,14 +49,41 @@ async def on_startup():
     Base.metadata.create_all(bind=engine)
     run_light_migrations(engine)
 
+    # Reconcile any dirty unconfirmed pump_running states
+    # from previous unexpected shutdown.
+    from app.database import SessionLocal
+
+    with SessionLocal() as db:
+        stale_pumps = (
+            db.query(models.Device)
+            .filter(
+                models.Device.pump_running.is_(True)
+            )
+            .all()
+        )
+
+        for d in stale_pumps:
+            d.pump_running = False
+
+        db.commit()
+
     print("[STARTUP] Database ready")
-    print(f"[STARTUP] AUTO_WATER_ENABLED = {settings.AUTO_WATER_ENABLED}")
+    print(
+        f"[STARTUP] AUTO_WATER_ENABLED = "
+        f"{settings.AUTO_WATER_ENABLED}"
+    )
 
     if settings.AUTO_WATER_ENABLED:
-        asyncio.create_task(auto_watering_loop())
-        print("[AUTO-WATERING] Background loop STARTED")
+        asyncio.create_task(
+            auto_watering_loop()
+        )
+        print(
+            "[AUTO-WATERING] Background loop STARTED"
+        )
     else:
-        print("[AUTO-WATERING] Disabled by configuration")
+        print(
+            "[AUTO-WATERING] Disabled by configuration"
+        )
 
 
 app.include_router(auth.router)
@@ -97,7 +124,9 @@ if FRONTEND_DIST.is_dir():
     if (FRONTEND_DIST / "assets").is_dir():
         app.mount(
             "/assets",
-            StaticFiles(directory=FRONTEND_DIST / "assets"),
+            StaticFiles(
+                directory=FRONTEND_DIST / "assets"
+            ),
             name="assets",
         )
 

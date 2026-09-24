@@ -18,6 +18,7 @@
  *      soil >= HIGH threshold
  *      OR sunlight < minimum threshold
  *      OR rain > 50%
+ *      OR soil sensor fault
  *
  * Hardware:
  *   Relay      = ACTIVE LOW
@@ -86,10 +87,22 @@ const float DEFAULT_SOIL_LOW  = 35.0;
 const float DEFAULT_SOIL_HIGH = 70.0;
 
 // ============================================================================
-// RAIN
+// RAIN CALIBRATION
+// ============================================================================
+//
+// Absolute calibration:
+//
+// DRY  -> approximately 3800
+// WET  -> approximately 1400
+//
+// Lower ADC value = more wet.
+//
 // ============================================================================
 
-const int RAIN_FULL_WET_DELTA = 800;
+const int RAIN_ADC_DRY = 3800;
+const int RAIN_ADC_WET = 1400;
+
+const int RAIN_DISCONNECT_ADC = 30;
 
 const float RAIN_STOP_THRESHOLD = 50.0;
 
@@ -99,17 +112,16 @@ const float RAIN_STOP_THRESHOLD = 50.0;
 //
 // IMPORTANT:
 //
-// The ESP32 ADC is 0-4095.
+// Your current hardware requires inverted LDR polarity.
 //
-// If shining more light onto your LDR makes the ADC value INCREASE,
-// keep this true.
+// More light -> LOWER ADC value.
 //
-// If shining more light makes the ADC value DECREASE,
-// change this to false.
+// Therefore:
+//     LDR_BRIGHT_WHEN_HIGH = false
 //
 // ============================================================================
 
-const bool LDR_BRIGHT_WHEN_HIGH = true;
+const bool LDR_BRIGHT_WHEN_HIGH = false;
 
 // AUTO irrigation is blocked below this sunlight level.
 const float DEFAULT_SUNLIGHT_MIN = 30.0;
@@ -243,15 +255,6 @@ bool autoModeEnabled = false;
 
 bool buzzerOn = false;
 uint32_t buzzerOffAtMs = 0;
-
-// ============================================================================
-// RAIN BASELINE
-// ============================================================================
-
-bool rainBaselineSet = false;
-int rainBaselineRaw = 0;
-
-const uint32_t RAIN_BASELINE_SETTLE_MS = 200;
 
 // ============================================================================
 // NETWORK STATE
@@ -404,27 +407,6 @@ int readAnalogAvg(
 }
 
 // ============================================================================
-// RAIN BASELINE
-// ============================================================================
-
-void captureRainBaseline() {
-
-  delay(
-      RAIN_BASELINE_SETTLE_MS
-  );
-
-  rainBaselineRaw =
-      readAnalogAvg(RAIN_PIN);
-
-  rainBaselineSet = true;
-
-  Serial.printf(
-      "[RAIN] baseline=%d\n",
-      rainBaselineRaw
-  );
-}
-
-// ============================================================================
 // SENSOR READING
 // ============================================================================
 
@@ -474,36 +456,58 @@ void readSensors() {
   // ========================================================================
   // RAIN
   // ========================================================================
+  //
+  // Absolute calibration:
+  //
+  //     RAIN_ADC_DRY = 3800
+  //     RAIN_ADC_WET = 1400
+  //
+  // Therefore:
+  //
+  //     ADC 3800 -> 0% rain
+  //     ADC 1400 -> 100% rain
+  //
+  // ADC below 30 is treated as disconnected/faulty and NOT as rain.
+  //
+  // ========================================================================
 
   sensors.rainRaw =
       readAnalogAvg(RAIN_PIN);
 
-  if (!rainBaselineSet) {
+  if (
+      sensors.rainRaw <
+      RAIN_DISCONNECT_ADC
+  ) {
 
-    sensors.rainIntensity = 0;
-    sensors.rainWet = false;
+    sensors.rainIntensity =
+        0.0f;
+
+    sensors.rainWet =
+        false;
 
   } else {
 
-    int delta =
-        sensors.rainRaw -
-        rainBaselineRaw;
+    float wetSpan =
+        (float)(
+          RAIN_ADC_DRY -
+          RAIN_ADC_WET
+        );
 
-    if (delta < 0)
-      delta = -delta;
-
-    float denominator =
-        RAIN_FULL_WET_DELTA > 0
-        ? (float)RAIN_FULL_WET_DELTA
-        : 1.0f;
+    if (wetSpan <= 0)
+      wetSpan = 1.0f;
 
     sensors.rainIntensity =
         clampf(
-          delta *
+          (
+            float
+          )(
+            RAIN_ADC_DRY -
+            sensors.rainRaw
+          ) *
           100.0f /
-          denominator,
-          0,
-          100
+          wetSpan,
+          0.0f,
+          100.0f
         );
 
     sensors.rainWet =
@@ -573,7 +577,7 @@ void readSensors() {
       "[SENSORS] "
       "SOIL=%5.1f%% raw=%4d fault=%d | "
       "LDR=%5.1f%% raw=%4d | "
-      "RAIN=%5.1f%% raw=%4d\n",
+      "RAIN=%5.1f%% raw=%4d wet=%d\n",
 
       sensors.soilPct,
       sensors.soilRaw,
@@ -583,7 +587,8 @@ void readSensors() {
       sensors.ldrRaw,
 
       sensors.rainIntensity,
-      sensors.rainRaw
+      sensors.rainRaw,
+      sensors.rainWet
   );
 }
 
@@ -895,9 +900,24 @@ void pumpUpdate() {
       SRC_AUTO
   ) {
 
+    // ----------------------------------------------------------------------
+    // NEW: SOIL SENSOR FAULT SAFETY
+    // ----------------------------------------------------------------------
+
+    if (sensors.soilFault) {
+
+      stopPump(
+          "soil sensor fault detected"
+      );
+
+      return;
+    }
+
+    // ----------------------------------------------------------------------
     // Soil reached target
+    // ----------------------------------------------------------------------
+
     if (
-        !sensors.soilFault &&
         sensors.soilPct >=
         autoSoilHigh
     ) {
@@ -909,7 +929,10 @@ void pumpUpdate() {
       return;
     }
 
+    // ----------------------------------------------------------------------
     // Sunlight became insufficient
+    // ----------------------------------------------------------------------
+
     if (
         sensors.lightPct <
         autoSunlightMin
@@ -1061,13 +1084,6 @@ String buildReadingJson() {
 
   // ========================================================================
   // SUNLIGHT
-  // ========================================================================
-  //
-  // IMPORTANT:
-  // Backend expects light_level in 0-100 range.
-  //
-  // DO NOT multiply by 12.
-  //
   // ========================================================================
 
   float serverLightLevel =
@@ -1900,16 +1916,25 @@ void setup() {
   // ========================================================================
   // RELAY
   // ========================================================================
+  //
+  // IMPORTANT:
+  // Keep the relay OFF before normal operation.
+  //
+  // The requested initialization order is:
+  //
+  //     digitalWrite(RELAY_PIN, RELAY_OFF_LEVEL);
+  //     pinMode(RELAY_PIN, OUTPUT);
+  //
+  // ========================================================================
+
+  digitalWrite(
+      RELAY_PIN,
+      RELAY_OFF_LEVEL
+  );
 
   pinMode(
       RELAY_PIN,
       OUTPUT
-  );
-
-  // Force physical pump OFF immediately.
-  digitalWrite(
-      RELAY_PIN,
-      RELAY_OFF_LEVEL
   );
 
   pumpIsOn = false;
@@ -1990,8 +2015,6 @@ void setup() {
 
   readSensors();
 
-  captureRainBaseline();
-
   readSensors();
 
   // ========================================================================
@@ -2053,6 +2076,21 @@ void setup() {
       LDR_BRIGHT_WHEN_HIGH
       ? "ADC HIGH"
       : "ADC LOW"
+  );
+
+  Serial.printf(
+      "[CONFIG] Rain dry ADC = %d\n",
+      RAIN_ADC_DRY
+  );
+
+  Serial.printf(
+      "[CONFIG] Rain wet ADC = %d\n",
+      RAIN_ADC_WET
+  );
+
+  Serial.printf(
+      "[CONFIG] Rain disconnect ADC = %d\n",
+      RAIN_DISCONNECT_ADC
   );
 
   Serial.println(

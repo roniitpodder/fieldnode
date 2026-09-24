@@ -52,18 +52,33 @@ export function useFieldData(enabled: boolean) {
   const loadBase = useCallback(async () => {
     setError(null);
     try {
-      const [farmList, cropList] = await Promise.all([api.listFarms(), api.listCrops()]);
+      const [farmList, cropList] = await Promise.all([
+        api.listFarms(),
+        api.listCrops(),
+      ]);
+
       setFarms(farmList);
       setCrops(cropList);
 
       const zoneList = await api.listZones(farmList[0]?.id);
       setZones(zoneList);
+
       setZoneId((current) => {
-        if (current && zoneList.some((zone) => zone.id === current)) return current;
+        if (
+          current &&
+          zoneList.some((zone) => zone.id === current)
+        ) {
+          return current;
+        }
+
         return zoneList[0]?.id ?? null;
       });
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Could not load your farm.");
+      setError(
+        err instanceof Error
+          ? err.message
+          : "Could not load your farm.",
+      );
     } finally {
       setLoading(false);
     }
@@ -71,6 +86,7 @@ export function useFieldData(enabled: boolean) {
 
   useEffect(() => {
     if (!enabled) return;
+
     setLoading(true);
     loadBase();
   }, [enabled, loadBase]);
@@ -78,15 +94,30 @@ export function useFieldData(enabled: boolean) {
   /* ------------------------------------------------------ per-zone data */
   const loadZone = useCallback(async (id: string) => {
     try {
-      const [zoneOverview, zoneReadings, zoneDevices, zoneEvents, zoneSchedules] = await Promise.all([
+      const [
+        zoneOverview,
+        zoneReadings,
+        zoneDevices,
+        zoneEvents,
+        zoneSchedules,
+      ] = await Promise.all([
         api.zoneOverview(id),
-        api.zoneReadings(id, 24).catch(() => [] as SensorReading[]),
-        api.listDevices(id).catch(() => [] as Device[]),
-        api.pumpEvents(id, 50).catch(() => [] as WateringEvent[]),
-        api.listSchedules(id).catch(() => [] as Schedule[]),
+        api.zoneReadings(id, 24).catch(
+          () => [] as SensorReading[],
+        ),
+        api.listDevices(id).catch(
+          () => [] as Device[],
+        ),
+        api.pumpEvents(id, 50).catch(
+          () => [] as WateringEvent[],
+        ),
+        api.listSchedules(id).catch(
+          () => [] as Schedule[],
+        ),
       ]);
-      if (zoneIdRef.current !== id) return; // a newer zone was selected mid-flight
-      
+
+      if (zoneIdRef.current !== id) return;
+
       setOverview(zoneOverview);
       setReadings(zoneReadings);
       setDevices(zoneDevices);
@@ -96,18 +127,35 @@ export function useFieldData(enabled: boolean) {
 
       // Check if device reports online status
       const primaryDevice = zoneDevices[0];
-      if (primaryDevice && typeof (primaryDevice as any).hardware_online === "boolean") {
-        setHardwareOnline((primaryDevice as any).hardware_online);
+
+      if (primaryDevice) {
+        setHardwareOnline(
+          Boolean(primaryDevice.is_online),
+        );
+      } else if (zoneOverview) {
+        setHardwareOnline(
+          Boolean(zoneOverview.device_online),
+        );
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Could not load zone telemetry.");
+      setError(
+        err instanceof Error
+          ? err.message
+          : "Could not load zone telemetry.",
+      );
     }
   }, []);
 
   useEffect(() => {
     if (!enabled || !zoneId) return;
+
     loadZone(zoneId);
-    const timer = window.setInterval(() => loadZone(zoneId), OVERVIEW_POLL_MS);
+
+    const timer = window.setInterval(
+      () => loadZone(zoneId),
+      OVERVIEW_POLL_MS,
+    );
+
     return () => window.clearInterval(timer);
   }, [enabled, zoneId, loadZone]);
 
@@ -116,8 +164,11 @@ export function useFieldData(enabled: boolean) {
     try {
       const [feed, notes] = await Promise.all([
         api.activity(undefined, 100),
-        api.notifications().catch(() => [] as Notification[]),
+        api.notifications().catch(
+          () => [] as Notification[],
+        ),
       ]);
+
       setNotifications(notes);
       return feed;
     } catch {
@@ -126,16 +177,25 @@ export function useFieldData(enabled: boolean) {
   }, []);
 
   const [activity, setActivity] = useState<WateringEvent[]>([]);
+
   useEffect(() => {
     if (!enabled) return;
+
     loadActivity().then(setActivity);
-    const timer = window.setInterval(() => loadActivity().then(setActivity), OVERVIEW_POLL_MS * 2);
+
+    const timer = window.setInterval(
+      () =>
+        loadActivity().then(setActivity),
+      OVERVIEW_POLL_MS * 2,
+    );
+
     return () => window.clearInterval(timer);
   }, [enabled, loadActivity]);
 
   /* -------------------------------------------- live telemetry over WS */
   useEffect(() => {
     if (!enabled || !zoneId) return;
+
     const url = zoneSocketUrl(zoneId);
     if (!url) return;
 
@@ -145,6 +205,7 @@ export function useFieldData(enabled: boolean) {
 
     const connect = () => {
       if (closed) return;
+
       try {
         socket = new WebSocket(url);
       } catch {
@@ -155,6 +216,7 @@ export function useFieldData(enabled: boolean) {
 
       socket.onmessage = (message) => {
         let payload: any;
+
         try {
           payload = JSON.parse(message.data);
         } catch {
@@ -163,81 +225,157 @@ export function useFieldData(enabled: boolean) {
 
         if (payload.event === "reading") {
           setLastSync(new Date());
-          setHardwareOnline(true); // Fresh reading means hardware is active
+          setHardwareOnline(true);
+
           setOverview((current) =>
             current
               ? {
                   ...current,
                   soil_moisture:
-                    payload.soil_moisture ?? current.soil_moisture,
+                    payload.soil_moisture ??
+                    current.soil_moisture,
+
                   temperature:
-                    payload.temperature ?? current.temperature,
+                    payload.temperature ??
+                    current.temperature,
+
                   sunlight_pct:
-                    payload.sunlight_pct ?? current.sunlight_pct,
+                    payload.sunlight_pct ??
+                    current.sunlight_pct,
+
                   raining_now:
-                    payload.rain_detected ?? current.raining_now,
+                    payload.rain_detected ??
+                    current.raining_now,
+
+                  pump_running:
+                    typeof payload.pump_is_on === "boolean"
+                      ? payload.pump_is_on
+                      : current.pump_running,
                 }
               : current,
           );
+
           setReadings((current) => {
             const next = [
               ...current,
               {
-                id: `ws-${payload.timestamp ?? Date.now()}`,
+                id: `ws-${
+                  payload.timestamp ?? Date.now()
+                }`,
                 device_id: payload.device_id,
-                timestamp: payload.timestamp ?? new Date().toISOString(),
-                soil_moisture: payload.soil_moisture ?? null,
-                temperature: payload.temperature ?? null,
-                humidity: payload.humidity ?? null,
-                light_level: payload.light_level ?? null,
-                sunlight_pct: payload.sunlight_pct ?? null,
-                rain_detected: payload.rain_detected ?? null,
-                rain_intensity: payload.rain_intensity ?? null,
+                timestamp:
+                  payload.timestamp ??
+                  new Date().toISOString(),
+
+                soil_moisture:
+                  payload.soil_moisture ?? null,
+
+                temperature:
+                  payload.temperature ?? null,
+
+                humidity:
+                  payload.humidity ?? null,
+
+                light_level:
+                  payload.light_level ?? null,
+
+                sunlight_pct:
+                  payload.sunlight_pct ?? null,
+
+                rain_detected:
+                  payload.rain_detected ?? null,
+
+                rain_intensity:
+                  payload.rain_intensity ?? null,
+
                 sensor_fault: false,
               } as SensorReading,
             ];
+
             return next.slice(-300);
           });
         }
 
-        if (payload.event === "pump_state" || payload.event === "pump_command_queued") {
+        if (
+          payload.event === "pump_state" ||
+          payload.event === "pump_command_queued"
+        ) {
           setLastSync(new Date());
           setHardwareOnline(true);
-          if (typeof payload.pump_running === "boolean") {
-            setOverview((current) => (current ? { ...current, pump_running: payload.pump_running } : current));
+
+          if (
+            typeof payload.pump_running === "boolean"
+          ) {
+            setOverview((current) =>
+              current
+                ? {
+                    ...current,
+                    pump_running:
+                      payload.pump_running,
+                  }
+                : current,
+            );
           }
-          if (zoneIdRef.current) loadZone(zoneIdRef.current);
+
+          if (zoneIdRef.current) {
+            loadZone(zoneIdRef.current);
+          }
         }
       };
 
       socket.onclose = () => {
         setLive(false);
-        if (!closed) retry = window.setTimeout(connect, 5000);
+
+        if (!closed) {
+          retry = window.setTimeout(
+            connect,
+            5000,
+          );
+        }
       };
-      socket.onerror = () => socket?.close();
+
+      socket.onerror = () =>
+        socket?.close();
     };
 
     connect();
+
     return () => {
       closed = true;
       setLive(false);
-      if (retry) window.clearTimeout(retry);
+
+      if (retry) {
+        window.clearTimeout(retry);
+      }
+
       socket?.close();
     };
   }, [enabled, zoneId, loadZone]);
 
   // Compute staleness based on lastSync time difference
-  const isStale = lastSync ? Date.now() - lastSync.getTime() > STALE_THRESHOLD_MS : true;
-  const isHardwareOffline = !hardwareOnline || isStale;
+  const isStale = lastSync
+    ? Date.now() - lastSync.getTime() >
+      STALE_THRESHOLD_MS
+    : true;
+
+  const isHardwareOffline =
+    !hardwareOnline || isStale;
 
   const refresh = useCallback(async () => {
     await loadBase();
-    if (zoneIdRef.current) await loadZone(zoneIdRef.current);
+
+    if (zoneIdRef.current) {
+      await loadZone(zoneIdRef.current);
+    }
+
     setActivity(await loadActivity());
   }, [loadBase, loadZone, loadActivity]);
 
   const refreshZone = useCallback(async () => {
-    if (zoneIdRef.current) await loadZone(zoneIdRef.current);
+    if (zoneIdRef.current) {
+      await loadZone(zoneIdRef.current);
+    }
+
     setActivity(await loadActivity());
   }, [loadZone, loadActivity]);
 
@@ -258,7 +396,7 @@ export function useFieldData(enabled: boolean) {
     error,
     lastSync,
     live,
-    isHardwareOffline, // <--- Exposed for UI warning and state overriding
+    isHardwareOffline,
     refresh,
     refreshZone,
     setZones,

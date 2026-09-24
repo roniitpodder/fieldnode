@@ -212,10 +212,8 @@ async def poll_command(
     """
     ESP32 polls this endpoint for a pending command.
 
-    IMPORTANT:
-    Receiving a command does NOT mean the physical pump is ON.
-
-    Therefore device.pump_running is intentionally NOT modified here.
+    Returns live zone thresholds and true mode so ESP32
+    firmware stays in sync.
     """
 
     # --------------------------------------------------------
@@ -225,21 +223,48 @@ async def poll_command(
     device.last_seen = datetime.utcnow()
 
     # --------------------------------------------------------
+    # GET PARENT ZONE
+    # --------------------------------------------------------
+
+    zone = (
+        db.query(models.Zone)
+        .filter(
+            models.Zone.id == device.zone_id
+        )
+        .first()
+    )
+
+    # --------------------------------------------------------
+    # DETERMINE ACTIVE ZONE MODE
+    # --------------------------------------------------------
+
+    zone_mode = (
+        "auto"
+        if (zone and zone.auto_mode)
+        else "manual"
+    )
+
+    # --------------------------------------------------------
     # READ PENDING COMMAND
     # --------------------------------------------------------
 
     command = device.pending_command
     duration = device.pending_command_duration
 
-    # New field added to Device model.
     source = (
         device.pending_command_source
-        or "manual"
+        or zone_mode
     )
 
-    # Normalize source.
-    if source not in ("auto", "manual"):
-        source = "manual"
+    # --------------------------------------------------------
+    # CLEAR PENDING COMMAND AFTER READING
+    # --------------------------------------------------------
+
+    device.pending_command = None
+    device.pending_command_duration = None
+    device.pending_command_source = None
+
+    db.commit()
 
     # --------------------------------------------------------
     # SMS MESSAGE
@@ -262,30 +287,36 @@ async def poll_command(
         )
 
     # --------------------------------------------------------
-    # CLEAR COMMAND
-    # --------------------------------------------------------
-    #
-    # We clear it because ESP32 has received it.
-    #
-    # We DO NOT set pump_running=True here.
-    #
-    # Physical pump state should come from ESP32 telemetry.
-    # --------------------------------------------------------
-
-    device.pending_command = None
-    device.pending_command_duration = None
-    device.pending_command_source = None
-
-    db.commit()
-
-    # --------------------------------------------------------
     # RESPONSE TO ESP32
     # --------------------------------------------------------
 
     return {
         "command": command,
         "duration_seconds": duration,
-        "mode": source,
+
+        # If there is a queued command, return its source.
+        # Otherwise return the actual current zone mode.
+        "mode": source if command else zone_mode,
+
+        # Live crop/zone thresholds.
+        "moisture_threshold_low": (
+            float(zone.moisture_threshold_low)
+            if zone
+            else 35.0
+        ),
+
+        "moisture_threshold_high": (
+            float(zone.moisture_threshold_high)
+            if zone
+            else 70.0
+        ),
+
+        "sunlight_threshold": (
+            float(zone.sunlight_threshold)
+            if zone
+            else 30.0
+        ),
+
         "sms_alert": sms_text,
     }
 

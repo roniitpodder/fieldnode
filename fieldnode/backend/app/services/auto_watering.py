@@ -27,12 +27,13 @@ IMPORTANT:
 
 import asyncio
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta, date
 
 from app import models
 from app.config import settings
 from app.database import SessionLocal
 from app.services.rain_sensor import get_rain_sensor_status
+from app.services.rain import get_rain_forecast
 from app.services.sunlight import sunlight_percent
 
 
@@ -412,18 +413,26 @@ def _check_zone(db, zone) -> str:
     # ========================================================================
 
     age = (
-        datetime.utcnow() -
-        latest.timestamp
+        datetime.utcnow()
+        - latest.timestamp
     ).total_seconds()
 
-    if age > settings.READING_STALE_SECONDS:
+    # Use the stricter of the two limits so the auto-watering
+    # controller cannot continue using readings beyond the
+    # device offline threshold.
+    stale_limit = min(
+        float(settings.READING_STALE_SECONDS),
+        float(settings.DEVICE_OFFLINE_AFTER_SECONDS),
+    )
+
+    if age > stale_limit:
 
         logger.warning(
             "%s: sensor data stale -- "
             "%.0fs > %ss",
             tag,
             age,
-            settings.READING_STALE_SECONDS,
+            stale_limit,
         )
 
         if device.pump_running:
@@ -696,6 +705,94 @@ def _check_zone(db, zone) -> str:
         )
 
         return "none"
+
+    # ========================================================================
+    # 14.5 COOLDOWN & WEATHER FORECAST CHECK
+    # ========================================================================
+
+    min_gap_seconds = (
+        getattr(
+            settings,
+            "AUTO_WATER_MIN_GAP_MINUTES",
+            60,
+        )
+        * 60
+    )
+
+    recent_watering = (
+        db.query(models.WateringEvent)
+        .filter(
+            models.WateringEvent.zone_id == zone.id,
+            models.WateringEvent.amount_liters > 0,
+        )
+        .order_by(
+            models.WateringEvent.timestamp.desc()
+        )
+        .first()
+    )
+
+    if recent_watering:
+
+        since_last = (
+            datetime.utcnow()
+            - recent_watering.timestamp
+        ).total_seconds()
+
+        if since_last < min_gap_seconds:
+
+            logger.info(
+                "%s: START blocked -- "
+                "cooldown in effect "
+                "(%.0fs < %.0fs)",
+                tag,
+                since_last,
+                min_gap_seconds,
+            )
+
+            return "none"
+
+    # ------------------------------------------------------------------------
+    # RAIN FORECAST CHECK
+    # ------------------------------------------------------------------------
+
+    try:
+
+        forecast = get_rain_forecast(
+            zone.id,
+            date.today() + timedelta(days=1),
+            latitude=(
+                zone.farm.latitude
+                if zone.farm
+                else None
+            ),
+            longitude=(
+                zone.farm.longitude
+                if zone.farm
+                else None
+            ),
+        )
+
+        if (
+            forecast.probability is not None
+            and forecast.probability >= 65.0
+        ):
+
+            if soil >= (low_threshold - 10.0):
+
+                logger.info(
+                    "%s: START skipped -- "
+                    "high rain forecast (%.1f%%) "
+                    "and soil not critically dry (%.1f%%)",
+                    tag,
+                    forecast.probability,
+                    soil,
+                )
+
+                return "none"
+
+    except Exception:
+
+        pass
 
     # ========================================================================
     # 15. START
