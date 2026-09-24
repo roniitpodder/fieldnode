@@ -22,17 +22,38 @@ def _notify(db: Session, user_id: str, type_: models.NotificationType, message: 
 def maybe_notify_from_reading(db: Session, device: models.Device, reading: models.SensorReading):
     user_id = _owner_user_id(db, device)
 
+    # -------------------------------------------------------------------------
+    # Sensor Fault: Notify ONLY on the healthy -> faulty transition
+    # -------------------------------------------------------------------------
     if reading.sensor_fault:
-        _notify(db, user_id, models.NotificationType.SENSOR_FAULT,
-                f"Sensor fault reported by {device.device_code}.")
+        prev = (
+            db.query(models.SensorReading)
+            .filter(
+                models.SensorReading.device_id == device.id,
+                models.SensorReading.id != reading.id,
+            )
+            .order_by(models.SensorReading.timestamp.desc())
+            .first()
+        )
+        was_healthy = prev is None or not prev.sensor_fault
+        
+        if was_healthy:
+            _notify(
+                db, user_id, models.NotificationType.SENSOR_FAULT,
+                f"Sensor fault reported by {device.device_code}."
+            )
 
-    # Rain: notify only on the dry -> wet TRANSITION, not on every reading while it rains.
+    # -------------------------------------------------------------------------
+    # Rain: Notify ONLY on the dry -> wet transition
+    # -------------------------------------------------------------------------
     if reading.rain_detected:
         prev = (
             db.query(models.SensorReading)
-            .filter(models.SensorReading.device_id == device.id,
-                    models.SensorReading.id != reading.id,
-                    models.SensorReading.rain_detected.isnot(None))
+            .filter(
+                models.SensorReading.device_id == device.id,
+                models.SensorReading.id != reading.id,
+                models.SensorReading.rain_detected.isnot(None),
+            )
             .order_by(models.SensorReading.timestamp.desc())
             .first()
         )
@@ -41,7 +62,10 @@ def maybe_notify_from_reading(db: Session, device: models.Device, reading: model
             or not prev.rain_detected
             or (reading.timestamp - prev.timestamp).total_seconds() > settings.RAIN_SENSOR_FRESH_SECONDS
         )
+        
         if was_dry:
-            _notify(db, user_id, models.NotificationType.RAIN_SKIP,
-                    f"Rain detected at {device.device_code}. Automatic watering is on hold "
-                    f"until the rain sensor dries.")
+            _notify(
+                db, user_id, models.NotificationType.RAIN_SKIP,
+                f"Rain detected at {device.device_code}. Automatic watering is on hold "
+                f"until the rain sensor dries."
+            )

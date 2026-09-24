@@ -14,6 +14,7 @@ import {
 } from "@/lib/api";
 
 const OVERVIEW_POLL_MS = 20000;
+const STALE_THRESHOLD_MS = 15000; // 15 seconds threshold for ESP32 hardware timeout
 
 export type FieldData = ReturnType<typeof useFieldData>;
 
@@ -39,6 +40,7 @@ export function useFieldData(enabled: boolean) {
   const [error, setError] = useState<string | null>(null);
   const [lastSync, setLastSync] = useState<Date | null>(null);
   const [live, setLive] = useState(false);
+  const [hardwareOnline, setHardwareOnline] = useState<boolean>(true);
 
   const zoneIdRef = useRef<string | null>(null);
   zoneIdRef.current = zoneId;
@@ -81,12 +83,19 @@ export function useFieldData(enabled: boolean) {
         api.listSchedules(id).catch(() => [] as Schedule[]),
       ]);
       if (zoneIdRef.current !== id) return; // a newer zone was selected mid-flight
+      
       setOverview(zoneOverview);
       setReadings(zoneReadings);
       setDevices(zoneDevices);
       setEvents(zoneEvents);
       setSchedules(zoneSchedules);
       setLastSync(new Date());
+
+      // Check if device reports online status
+      const primaryDevice = zoneDevices[0];
+      if (primaryDevice && typeof (primaryDevice as any).hardware_online === "boolean") {
+        setHardwareOnline((primaryDevice as any).hardware_online);
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not load zone telemetry.");
     }
@@ -151,6 +160,7 @@ export function useFieldData(enabled: boolean) {
 
         if (payload.event === "reading") {
           setLastSync(new Date());
+          setHardwareOnline(true); // Fresh reading means hardware is active
           setOverview((current) =>
             current
               ? {
@@ -184,6 +194,8 @@ export function useFieldData(enabled: boolean) {
         }
 
         if (payload.event === "pump_state" || payload.event === "pump_command_queued") {
+          setLastSync(new Date());
+          setHardwareOnline(true);
           if (typeof payload.pump_running === "boolean") {
             setOverview((current) => (current ? { ...current, pump_running: payload.pump_running } : current));
           }
@@ -206,6 +218,10 @@ export function useFieldData(enabled: boolean) {
       socket?.close();
     };
   }, [enabled, zoneId, loadZone]);
+
+  // Compute staleness based on lastSync time difference
+  const isStale = lastSync ? Date.now() - lastSync.getTime() > STALE_THRESHOLD_MS : true;
+  const isHardwareOffline = !hardwareOnline || isStale;
 
   const refresh = useCallback(async () => {
     await loadBase();
@@ -235,6 +251,7 @@ export function useFieldData(enabled: boolean) {
     error,
     lastSync,
     live,
+    isHardwareOffline, // <--- Exposed for UI warning and state overriding
     refresh,
     refreshZone,
     setZones,

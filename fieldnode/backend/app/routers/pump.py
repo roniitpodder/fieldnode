@@ -147,45 +147,28 @@ async def poll_command(
     db: Session = Depends(get_db),
     device: models.Device = Depends(get_device_from_api_key),
 ):
-    """
-    ESP32 polls this endpoint.
-
-    The backend puts either:
-        start
-        stop
-        null
-
-    into pending_command.
-    """
+    device.last_seen = datetime.utcnow()
 
     command = device.pending_command
     duration = device.pending_command_duration
+    
+    # Determine custom SMS text based on command
+    sms_text = None
+    if command == "start":
+        device.pump_running = True
+        sms_text = f"SU-Krishi: Pump STARTED via Dashboard for {duration}s."
+    elif command == "stop":
+        device.pump_running = False
+        sms_text = "SU-Krishi: Pump STOPPED via Dashboard."
 
-    if command:
-
-        if command == "start":
-            device.pump_running = True
-
-        elif command == "stop":
-            device.pump_running = False
-
-        # Clear command AFTER reading it.
-        device.pending_command = None
-        device.pending_command_duration = None
-
-        db.commit()
-
-        await manager.broadcast(
-            device.zone_id,
-            {
-                "event": "pump_state",
-                "pump_running": device.pump_running,
-            },
-        )
+    device.pending_command = None
+    device.pending_command_duration = None
+    db.commit()
 
     return {
         "command": command,
         "duration_seconds": duration,
+        "sms_alert": sms_text,  # <--- ESP32 reads this and sends SMS via SIM800L
     }
 
 
@@ -201,12 +184,10 @@ async def ack_command(
 ):
     """
     ESP32 calls this after the pump cycle has finished.
-
-    We determine whether the most recent unfinished event was
-    MANUAL or AUTO, then complete that event instead of
-    accidentally converting an AUTO cycle into a MANUAL cycle.
+    Updates last_seen heartbeat.
     """
 
+    device.last_seen = datetime.utcnow()
     device.pump_running = False
 
     liters = estimate_liters(
@@ -256,7 +237,6 @@ async def ack_command(
 
     else:
 
-        # If there is no pending event, treat it as AUTO.
         db.add(
             models.WateringEvent(
                 zone_id=device.zone_id,

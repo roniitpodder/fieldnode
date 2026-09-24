@@ -218,6 +218,7 @@ export default function Home() {
     error,
     lastSync,
     live,
+    isHardwareOffline,
     refresh,
     refreshZone,
     setZones,
@@ -694,6 +695,18 @@ export default function Home() {
                 </section>
               )}
 
+              {isHardwareOffline && (
+                <section className="notice-strip warn">
+                  <div className="notice-icon">
+                    <AlertTriangle size={18} />
+                  </div>
+                  <div>
+                    <strong>ESP32 Hardware Offline or Stale</strong>
+                    <span>Telemetry has not been received for over 15 seconds. The pump state below is unconfirmed and locked for safety.</span>
+                  </div>
+                </section>
+              )}
+
               <div className="metrics-grid">
                 <MetricCard
                   icon={Droplets}
@@ -843,20 +856,28 @@ export default function Home() {
                       {autoMode ? "Auto mode" : "Manual mode"}
                     </span>
                   </div>
-                  <div className={`pump-orb ${pumpRunning ? "running" : ""}`}>
-                    <div className="orb-glow" />
-                    <div className="pump-icon">
-                      <Droplets size={27} />
-                    </div>
-                    <span>{pumpRunning ? "PUMP ON" : "PUMP READY"}</span>
-                    <small>
-                      {pumpRunning
-                        ? `Watering ${zone?.name}`
-                        : nextPending
-                          ? `Next cycle · ${formatDateTime(nextPending.next_run_at)}`
-                          : "No cycle scheduled"}
-                    </small>
-                  </div>
+                  {/* If hardware is offline, force display to OFF/STALE */}
+                  {(() => {
+                    const displayRunning = isHardwareOffline ? false : pumpRunning;
+                    return (
+                      <div className={`pump-orb ${displayRunning ? "running" : ""} ${isHardwareOffline ? "offline-orb" : ""}`}>
+                        <div className="orb-glow" />
+                        <div className="pump-icon">
+                          <Droplets size={27} />
+                        </div>
+                        <span>{isHardwareOffline ? "OFFLINE / STALE" : displayRunning ? "PUMP ON" : "PUMP READY"}</span>
+                        <small>
+                          {isHardwareOffline
+                            ? "Node unreachable — state unconfirmed"
+                            : displayRunning
+                              ? `Watering ${zone?.name}`
+                              : nextPending
+                                ? `Next cycle · ${formatDateTime(nextPending.next_run_at)}`
+                                : "No cycle scheduled"}
+                        </small>
+                      </div>
+                    );
+                  })()}
                   <div className="mode-toggle">
                     <button className={autoMode ? "selected" : ""} onClick={() => !autoMode && toggleAutoMode()}>
                       <Sparkles size={15} /> Auto
@@ -881,9 +902,13 @@ export default function Home() {
                   <button
                     className={`pump-action ${pumpRunning ? "stop" : ""}`}
                     onClick={togglePump}
-                    disabled={autoMode || pumpBusy || !device}
+                    disabled={autoMode || pumpBusy || !device || isHardwareOffline}
                   >
-                    {pumpBusy ? (
+                    {isHardwareOffline ? (
+                      <>
+                        <AlertTriangle size={16} /> Hardware Offline
+                      </>
+                    ) : pumpBusy ? (
                       <>
                         <LoaderCircle size={16} className="spin" /> Sending…
                       </>
