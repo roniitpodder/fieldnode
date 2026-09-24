@@ -906,8 +906,6 @@ export default function Home() {
                       <small>seconds (max 300)</small>
                     </label>
                   )}
-                  // In fieldnode/frontend/client/src/pages/Home.tsx (line 924)
-
                     <button
                       className={`pump-action ${pumpRunning ? "stop" : ""}`}
                       onClick={togglePump}

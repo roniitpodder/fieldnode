@@ -1,5 +1,5 @@
 /*
- * SU-KRISHI - ESP32 field node
+ * SU-KRISHI - ESP32 FIELD NODE
  *
  * CONTROL RULES
  * -------------
@@ -9,7 +9,7 @@
  *   STOP  -> directly control relay
  *
  * AUTO:
- *   START only when:
+ *   START when:
  *      soil < LOW threshold
  *      sunlight >= minimum threshold
  *      rain <= 50%
@@ -19,6 +19,7 @@
  *      OR sunlight < minimum threshold
  *      OR rain > 50%
  *      OR soil sensor fault
+ *      OR maximum runtime reached
  *
  * Hardware:
  *   Relay      = ACTIVE LOW
@@ -90,12 +91,12 @@ const float DEFAULT_SOIL_HIGH = 70.0;
 // RAIN CALIBRATION
 // ============================================================================
 //
-// Absolute calibration:
+// Absolute calibration.
 //
-// DRY  -> approximately 3800
-// WET  -> approximately 1400
+// Dry  = approximately 3800 ADC
+// Wet  = approximately 1400 ADC
 //
-// Lower ADC value = more wet.
+// Lower ADC value means more water.
 //
 // ============================================================================
 
@@ -110,20 +111,16 @@ const float RAIN_STOP_THRESHOLD = 50.0;
 // LDR
 // ============================================================================
 //
-// IMPORTANT:
-//
-// Your current hardware requires inverted LDR polarity.
-//
-// More light -> LOWER ADC value.
+// Your hardware behaves as:
+//   More light -> LOWER ADC
 //
 // Therefore:
-//     LDR_BRIGHT_WHEN_HIGH = false
+//   LDR_BRIGHT_WHEN_HIGH = false
 //
 // ============================================================================
 
 const bool LDR_BRIGHT_WHEN_HIGH = false;
 
-// AUTO irrigation is blocked below this sunlight level.
 const float DEFAULT_SUNLIGHT_MIN = 30.0;
 
 // ============================================================================
@@ -134,6 +131,22 @@ const uint32_t BEEP_PUMP_ON_MS  = 3000;
 const uint32_t BEEP_PUMP_OFF_MS = 1000;
 
 const uint32_t MAX_PUMP_RUN_SECONDS = 300;
+
+// Automatic pump cycle.
+//
+// The ESP32 will start the pump for this maximum cycle,
+// but pumpUpdate() can stop it earlier when:
+//   - moisture reaches HIGH
+//   - rain > 50%
+//   - sunlight becomes insufficient
+//   - soil sensor fails
+//
+// ============================================================================
+
+const uint32_t AUTO_PUMP_CYCLE_SECONDS = 60;
+
+// Prevent immediate repeated auto-starts after a cycle ends.
+const uint32_t AUTO_RESTART_COOLDOWN_MS = 10000;
 
 // ============================================================================
 // TIMING
@@ -201,9 +214,11 @@ SensorData sensors = {
   0,
   0,
   true,
+
   0,
   false,
   0,
+
   0,
   LIGHT_DARK,
   0
@@ -237,6 +252,9 @@ PumpSource pumpSource = SRC_NONE;
 uint32_t pumpStartMs = 0;
 
 uint32_t pumpRunLimitMs = 0;
+
+// Last automatic start time
+uint32_t lastAutoStartMs = 0;
 
 // ============================================================================
 // AUTO CONFIG
@@ -304,6 +322,8 @@ void serviceCritical();
 void pumpUpdate();
 
 void buzzerUpdate();
+
+void autoPumpEvaluate();
 
 // ============================================================================
 // UTILITY
@@ -430,9 +450,7 @@ void readSensors() {
   } else {
 
     float span =
-        (
-          float
-        )(
+        (float)(
           SOIL_ADC_WET -
           SOIL_ADC_DRY
         );
@@ -459,15 +477,13 @@ void readSensors() {
   //
   // Absolute calibration:
   //
-  //     RAIN_ADC_DRY = 3800
-  //     RAIN_ADC_WET = 1400
+  // DRY ~ 3800
+  // WET ~ 1400
   //
   // Therefore:
   //
-  //     ADC 3800 -> 0% rain
-  //     ADC 1400 -> 100% rain
-  //
-  // ADC below 30 is treated as disconnected/faulty and NOT as rain.
+  // intensity =
+  //   (3800 - raw) / (3800 - 1400) * 100
   //
   // ========================================================================
 
@@ -479,11 +495,9 @@ void readSensors() {
       RAIN_DISCONNECT_ADC
   ) {
 
-    sensors.rainIntensity =
-        0.0f;
+    sensors.rainIntensity = 0.0f;
 
-    sensors.rainWet =
-        false;
+    sensors.rainWet = false;
 
   } else {
 
@@ -499,9 +513,7 @@ void readSensors() {
     sensors.rainIntensity =
         clampf(
           (
-            float
-          )(
-            RAIN_ADC_DRY -
+            (float)RAIN_ADC_DRY -
             sensors.rainRaw
           ) *
           100.0f /
@@ -533,10 +545,9 @@ void readSensors() {
 
     brightnessRaw =
         4095.0f -
-        sensors.ldrRaw;
+        (float)sensors.ldrRaw;
   }
 
-  // Convert ADC 0-4095 to sunlight 0-100%.
   sensors.lightPct =
       clampf(
         brightnessRaw *
@@ -546,7 +557,10 @@ void readSensors() {
         100
       );
 
-  // Categorize light.
+  // ========================================================================
+  // LIGHT CATEGORY
+  // ========================================================================
+
   if (
       sensors.lightPct <
       15.0f
@@ -797,6 +811,9 @@ bool startPump(
 
       return false;
     }
+
+    lastAutoStartMs =
+        millis();
   }
 
   pumpSource =
@@ -815,6 +832,14 @@ bool startPump(
       seconds * 1000UL;
 
   pumpON();
+
+  Serial.printf(
+      "[PUMP] START source=%s duration=%us\n",
+      source == SRC_AUTO
+        ? "AUTO"
+        : "MANUAL",
+      (unsigned)seconds
+  );
 
   return true;
 }
@@ -867,13 +892,147 @@ void stopPump(
 }
 
 // ============================================================================
+// AUTO PUMP EVALUATION
+// ============================================================================
+//
+// THIS IS THE IMPORTANT FIX.
+//
+// Previously the ESP32 only monitored an AUTO pump if something else
+// had already started it.
+//
+// Now the ESP32 itself starts the pump when AUTO conditions are satisfied.
+//
+// ============================================================================
+
+void autoPumpEvaluate() {
+
+  if (!autoModeEnabled)
+    return;
+
+  if (pumpIsOn)
+    return;
+
+  // --------------------------------------------------------------------------
+  // Soil sensor fault
+  // --------------------------------------------------------------------------
+
+  if (sensors.soilFault) {
+
+    Serial.println(
+        "[AUTO] WAITING: soil sensor fault"
+    );
+
+    return;
+  }
+
+  // --------------------------------------------------------------------------
+  // Soil must be below LOW threshold
+  // --------------------------------------------------------------------------
+
+  if (
+      sensors.soilPct >=
+      autoSoilLow
+  ) {
+
+    return;
+  }
+
+  // --------------------------------------------------------------------------
+  // Sunlight must be sufficient
+  // --------------------------------------------------------------------------
+
+  if (
+      sensors.lightPct <
+      autoSunlightMin
+  ) {
+
+    Serial.printf(
+        "[AUTO] WAITING: sunlight %.1f%% < %.1f%%\n",
+        sensors.lightPct,
+        autoSunlightMin
+    );
+
+    return;
+  }
+
+  // --------------------------------------------------------------------------
+  // Rain must not be detected
+  // --------------------------------------------------------------------------
+
+  if (
+      sensors.rainIntensity >
+      RAIN_STOP_THRESHOLD
+  ) {
+
+    Serial.printf(
+        "[AUTO] WAITING: rain %.1f%% > %.1f%%\n",
+        sensors.rainIntensity,
+        RAIN_STOP_THRESHOLD
+    );
+
+    return;
+  }
+
+  // --------------------------------------------------------------------------
+  // Cooldown after previous auto cycle
+  // --------------------------------------------------------------------------
+
+  if (
+      lastAutoStartMs != 0 &&
+      millis() - lastAutoStartMs <
+      AUTO_RESTART_COOLDOWN_MS
+  ) {
+
+    return;
+  }
+
+  // --------------------------------------------------------------------------
+  // ALL CONDITIONS SATISFIED
+  // --------------------------------------------------------------------------
+
+  Serial.printf(
+      "[AUTO] CONDITIONS SATISFIED -> "
+      "STARTING PUMP | "
+      "soil=%.1f%% "
+      "sun=%.1f%% "
+      "rain=%.1f%%\n",
+
+      sensors.soilPct,
+      sensors.lightPct,
+      sensors.rainIntensity
+  );
+
+  bool started =
+      startPump(
+          SRC_AUTO,
+          AUTO_PUMP_CYCLE_SECONDS
+      );
+
+  if (!started) {
+
+    Serial.println(
+        "[AUTO] START FAILED"
+    );
+  }
+}
+
+// ============================================================================
 // PUMP SAFETY / AUTO MONITOR
 // ============================================================================
 
 void pumpUpdate() {
 
-  if (!pumpIsOn)
+  // ========================================================================
+  // PUMP IS OFF
+  // ========================================================================
+
+  if (!pumpIsOn) {
+
+    // Automatically start if AUTO conditions are satisfied.
+    autoPumpEvaluate();
+
     return;
+  }
 
   // ========================================================================
   // RAIN SAFETY
@@ -901,7 +1060,7 @@ void pumpUpdate() {
   ) {
 
     // ----------------------------------------------------------------------
-    // NEW: SOIL SENSOR FAULT SAFETY
+    // SOIL SENSOR FAULT
     // ----------------------------------------------------------------------
 
     if (sensors.soilFault) {
@@ -914,7 +1073,7 @@ void pumpUpdate() {
     }
 
     // ----------------------------------------------------------------------
-    // Soil reached target
+    // SOIL REACHED TARGET
     // ----------------------------------------------------------------------
 
     if (
@@ -930,7 +1089,7 @@ void pumpUpdate() {
     }
 
     // ----------------------------------------------------------------------
-    // Sunlight became insufficient
+    // SUNLIGHT BECAME TOO LOW
     // ----------------------------------------------------------------------
 
     if (
@@ -1086,13 +1245,10 @@ String buildReadingJson() {
   // SUNLIGHT
   // ========================================================================
 
-  float serverLightLevel =
-      sensors.lightPct;
-
   json +=
       ",\"light_level\":" +
       String(
-        serverLightLevel,
+        sensors.lightPct,
         1
       );
 
@@ -1386,12 +1542,15 @@ void pollCommand() {
       ) >= 0
   ) {
 
+    if (!autoModeEnabled) {
+
+      Serial.println(
+          "[MODE] AUTO ENABLED"
+      );
+    }
+
     autoModeEnabled =
         true;
-
-    Serial.println(
-        "[MODE] AUTO"
-    );
   }
 
   if (
@@ -1400,12 +1559,15 @@ void pollCommand() {
       ) >= 0
   ) {
 
+    if (autoModeEnabled) {
+
+      Serial.println(
+          "[MODE] MANUAL ENABLED"
+      );
+    }
+
     autoModeEnabled =
         false;
-
-    Serial.println(
-        "[MODE] MANUAL"
-    );
   }
 
   // ========================================================================
@@ -1505,7 +1667,7 @@ void pollCommand() {
   }
 
   // ========================================================================
-  // START
+  // START COMMAND FROM BACKEND
   // ========================================================================
 
   if (
@@ -1577,7 +1739,7 @@ void pollCommand() {
   }
 
   // ========================================================================
-  // STOP
+  // STOP COMMAND
   // ========================================================================
 
   if (
@@ -1621,6 +1783,10 @@ void networkUpdate() {
   ) {
 
     pollCommand();
+
+    // IMPORTANT:
+    // pollCommand() may have just changed AUTO/MANUAL mode.
+    // Immediately evaluate AUTO after receiving the new mode.
 
     serviceCritical();
   }
@@ -1829,6 +1995,16 @@ void printSensors() {
   );
 
   Serial.printf(
+      "AUTO=%s | LOW=%.1f | HIGH=%.1f | SUN_MIN=%.1f\n",
+      autoModeEnabled
+      ? "ON"
+      : "OFF",
+      autoSoilLow,
+      autoSoilHigh,
+      autoSunlightMin
+  );
+
+  Serial.printf(
       "PUMP=%s source=%d\n",
       pumpIsOn
       ? "ON"
@@ -1852,12 +2028,20 @@ void handleSerial() {
 
     switch (c) {
 
+      // --------------------------------------------------------------------
+      // Sensors
+      // --------------------------------------------------------------------
+
       case 's':
 
         readSensors();
         printSensors();
 
         break;
+
+      // --------------------------------------------------------------------
+      // SIM test
+      // --------------------------------------------------------------------
 
       case 't':
 
@@ -1869,6 +2053,10 @@ void handleSerial() {
 
         break;
 
+      // --------------------------------------------------------------------
+      // SMS test
+      // --------------------------------------------------------------------
+
       case 'm':
 
         simSendSms(
@@ -1878,11 +2066,18 @@ void handleSerial() {
 
         break;
 
+      // --------------------------------------------------------------------
       // MANUAL ON
+      // --------------------------------------------------------------------
+
       case 'o':
 
         autoModeEnabled =
             false;
+
+        Serial.println(
+            "[SERIAL] MANUAL PUMP ON"
+        );
 
         startPump(
             SRC_MANUAL,
@@ -1891,12 +2086,36 @@ void handleSerial() {
 
         break;
 
+      // --------------------------------------------------------------------
       // MANUAL OFF
+      // --------------------------------------------------------------------
+
       case 'f':
+
+        Serial.println(
+            "[SERIAL] PUMP OFF"
+        );
 
         stopPump(
             "serial stop"
         );
+
+        break;
+
+      // --------------------------------------------------------------------
+      // FORCE AUTO MODE
+      // --------------------------------------------------------------------
+
+      case 'a':
+
+        autoModeEnabled =
+            true;
+
+        Serial.println(
+            "[SERIAL] AUTO MODE ENABLED"
+        );
+
+        serviceCritical();
 
         break;
 
@@ -1918,12 +2137,8 @@ void setup() {
   // ========================================================================
   //
   // IMPORTANT:
-  // Keep the relay OFF before normal operation.
-  //
-  // The requested initialization order is:
-  //
-  //     digitalWrite(RELAY_PIN, RELAY_OFF_LEVEL);
-  //     pinMode(RELAY_PIN, OUTPUT);
+  // Set the desired output latch BEFORE switching the GPIO to OUTPUT.
+  // This prevents the relay from briefly switching ON during initialization.
   //
   // ========================================================================
 
@@ -1935,6 +2150,12 @@ void setup() {
   pinMode(
       RELAY_PIN,
       OUTPUT
+  );
+
+  // Force physical pump OFF.
+  digitalWrite(
+      RELAY_PIN,
+      RELAY_OFF_LEVEL
   );
 
   pumpIsOn = false;
@@ -2010,10 +2231,8 @@ void setup() {
   );
 
   // ========================================================================
-  // SENSORS
+  // INITIAL SENSOR READ
   // ========================================================================
-
-  readSensors();
 
   readSensors();
 
@@ -2072,10 +2291,8 @@ void setup() {
   );
 
   Serial.printf(
-      "[CONFIG] LDR bright when %s\n",
-      LDR_BRIGHT_WHEN_HIGH
-      ? "ADC HIGH"
-      : "ADC LOW"
+      "[CONFIG] Auto pump cycle = %us\n",
+      (unsigned)AUTO_PUMP_CYCLE_SECONDS
   );
 
   Serial.printf(
@@ -2089,8 +2306,10 @@ void setup() {
   );
 
   Serial.printf(
-      "[CONFIG] Rain disconnect ADC = %d\n",
-      RAIN_DISCONNECT_ADC
+      "[CONFIG] LDR bright when %s\n",
+      LDR_BRIGHT_WHEN_HIGH
+      ? "ADC HIGH"
+      : "ADC LOW"
   );
 
   Serial.println(
@@ -2111,6 +2330,10 @@ void setup() {
 
   Serial.println(
       "f = pump OFF"
+  );
+
+  Serial.println(
+      "a = force AUTO mode"
   );
 }
 
@@ -2145,7 +2368,7 @@ void loop() {
 
     readSensors();
 
-    // Evaluate immediately using fresh values.
+    // Evaluate immediately using fresh sensor values.
     serviceCritical();
   }
 
@@ -2185,15 +2408,27 @@ void loop() {
 
     Serial.printf(
         "[STATUS] "
+        "mode=%s | "
         "pump=%s | "
+        "source=%s | "
         "soil=%.1f%% | "
         "sun=%.1f%% | "
         "rain=%.1f%% | "
         "wifi=%s\n",
 
+        autoModeEnabled
+        ? "AUTO"
+        : "MANUAL",
+
         pumpIsOn
         ? "ON"
         : "OFF",
+
+        pumpSource == SRC_AUTO
+        ? "AUTO"
+        : pumpSource == SRC_MANUAL
+        ? "MANUAL"
+        : "NONE",
 
         sensors.soilPct,
 
