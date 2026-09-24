@@ -81,6 +81,36 @@ async def ingest_reading(
     db.refresh(reading)
 
     # ---------------------------------------------------------
+    # IMMEDIATE AUTO-WATERING EVALUATION
+    # ---------------------------------------------------------
+    #
+    # Previously, auto-watering depended only on the periodic
+    # auto_watering_loop. This meant live ESP32 telemetry could
+    # take up to ~60 seconds to trigger a decision.
+    #
+    # Now the decision engine is evaluated immediately after
+    # every committed sensor reading.
+    #
+    # ---------------------------------------------------------
+
+    try:
+
+        from app.services.auto_watering import evaluate_zone_now
+
+        evaluate_zone_now(
+            db,
+            device.zone_id,
+        )
+
+    except Exception as exc:
+
+        # Do not let an auto-watering evaluation failure
+        # break the ESP32 telemetry endpoint.
+        print(
+            f"[AUTO-WATERING] Immediate evaluation failed: {exc}"
+        )
+
+    # ---------------------------------------------------------
     # PHYSICAL PUMP STATE BROADCAST
     # ---------------------------------------------------------
 

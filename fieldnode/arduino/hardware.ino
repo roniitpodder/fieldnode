@@ -188,7 +188,7 @@ const int RAIN_DISCONNECT_ADC = 30;
 //
 // ============================================================
 
-const bool LDR_BRIGHT_WHEN_HIGH = false;
+const bool LDR_BRIGHT_WHEN_HIGH = true;
 
 const float DEFAULT_SUNLIGHT_MIN = 30.0;
 

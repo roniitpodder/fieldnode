@@ -710,26 +710,19 @@ def _check_zone(db, zone) -> str:
     # 14.5 COOLDOWN & WEATHER FORECAST CHECK
     # ========================================================================
 
-    min_gap_seconds = (
-        getattr(
-            settings,
-            "AUTO_WATER_MIN_GAP_MINUTES",
-            60,
-        )
-        * 60
-    )
+    min_gap_minutes = float(getattr(settings, "AUTO_WATER_MIN_GAP_MINUTES", 0))
+    min_gap_seconds = min_gap_minutes * 60
 
     recent_watering = (
         db.query(models.WateringEvent)
         .filter(
             models.WateringEvent.zone_id == zone.id,
+            models.WateringEvent.trigger_type == models.TriggerType.AUTO,  # <-- Only auto cycles
             models.WateringEvent.amount_liters > 0,
         )
-        .order_by(
-            models.WateringEvent.timestamp.desc()
-        )
+        .order_by(models.WateringEvent.timestamp.desc())
         .first()
-    )
+    ) if min_gap_seconds > 0 else None
 
     if recent_watering:
 
