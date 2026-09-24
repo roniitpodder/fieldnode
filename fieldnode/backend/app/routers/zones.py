@@ -20,6 +20,7 @@ def _apply_preset_thresholds(db: Session, zone: models.Zone, crop_preset_id: Opt
         zone.crop_preset_id = preset.id
         zone.moisture_threshold_low = preset.moisture_min
         zone.moisture_threshold_high = preset.moisture_max
+        zone.sunlight_threshold = preset.sunlight_threshold
 
 
 @router.get("", response_model=List[schemas.ZoneOut])

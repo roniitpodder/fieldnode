@@ -13,8 +13,11 @@ import {
   type ZoneOverview,
 } from "@/lib/api";
 
-const OVERVIEW_POLL_MS = 20000;
-const STALE_THRESHOLD_MS = 15000; // 15 seconds threshold for ESP32 hardware timeout
+const OVERVIEW_POLL_MS = 10000;
+
+// ESP32 posts telemetry every 30 seconds.
+// Allow a few missed/delayed posts before declaring it stale.
+const STALE_THRESHOLD_MS = 90000;
 
 export type FieldData = ReturnType<typeof useFieldData>;
 
@@ -165,10 +168,14 @@ export function useFieldData(enabled: boolean) {
             current
               ? {
                   ...current,
-                  soil_moisture: payload.soil_moisture ?? current.soil_moisture,
-                  temperature: payload.temperature ?? current.temperature,
-                  sunlight_pct: payload.sunlight_pct ?? current.sunlight_pct,
-                  raining_now: payload.rain_detected ?? current.raining_now,
+                  soil_moisture:
+                    payload.soil_moisture ?? current.soil_moisture,
+                  temperature:
+                    payload.temperature ?? current.temperature,
+                  sunlight_pct:
+                    payload.sunlight_pct ?? current.sunlight_pct,
+                  raining_now:
+                    payload.rain_detected ?? current.raining_now,
                 }
               : current,
           );

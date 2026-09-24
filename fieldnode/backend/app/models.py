@@ -61,6 +61,7 @@ class CropPreset(Base):
     crop_name = Column(String, nullable=False, unique=True)
     moisture_min = Column(Float, nullable=False)  # %
     moisture_max = Column(Float, nullable=False)  # %
+    sunlight_threshold = Column(Float, default=30.0)
     notes = Column(String, nullable=True)
 
     zones = relationship("Zone", back_populates="crop_preset")
@@ -73,8 +74,9 @@ class Zone(Base):
     name = Column(String, nullable=False)  # e.g. "North greenhouse"
     soil_type = Column(String, default="loam")
     crop_preset_id = Column(String, ForeignKey("crop_presets.id"), nullable=True)
-    moisture_threshold_low = Column(Float, default=35.0)   # below -> water
-    moisture_threshold_high = Column(Float, default=70.0)  # above -> stop
+    moisture_threshold_low = Column(Float, default=35.0)    # below -> water
+    moisture_threshold_high = Column(Float, default=70.0)   # above -> stop
+    sunlight_threshold = Column(Float, default=30.0)        # below -> stop/block auto watering
     auto_mode = Column(Boolean, default=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
@@ -99,6 +101,7 @@ class Device(Base):
     pump_running = Column(Boolean, default=False)
     pending_command = Column(String, nullable=True)  # "start" | "stop" | None — polled by ESP32
     pending_command_duration = Column(Integer, nullable=True)
+    pending_command_source = Column(String, nullable=True)
     # No flow sensor: liters are estimated as run_time * this rate. Calibrate per pump.
     pump_flow_rate_lpm = Column(Float, default=1.2)  # liters per minute
     created_at = Column(DateTime, default=datetime.utcnow)

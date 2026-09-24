@@ -19,6 +19,8 @@ _NEW_COLUMNS = [
     ("sensor_readings", "rain_detected", "BOOLEAN"),
     ("sensor_readings", "rain_intensity", "FLOAT"),
     ("devices", "pump_flow_rate_lpm", "FLOAT DEFAULT 1.2"),
+    ("zones", "sunlight_threshold", "FLOAT DEFAULT 30.0"),
+    ("crop_presets", "sunlight_threshold", "FLOAT DEFAULT 30.0"),
 ]
 
 

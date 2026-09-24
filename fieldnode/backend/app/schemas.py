@@ -39,6 +39,7 @@ class CropPresetOut(BaseModel):
     crop_name: str
     moisture_min: float
     moisture_max: float
+    sunlight_threshold: float
     notes: Optional[str] = None
 
 
@@ -67,6 +68,7 @@ class ZoneCreate(BaseModel):
     crop_preset_id: Optional[str] = None
     moisture_threshold_low: float = 35.0
     moisture_threshold_high: float = 70.0
+    sunlight_threshold: float = 30.0
     auto_mode: bool = True
 
 
@@ -75,6 +77,7 @@ class ZoneUpdate(BaseModel):
     crop_preset_id: Optional[str] = None
     moisture_threshold_low: Optional[float] = None
     moisture_threshold_high: Optional[float] = None
+    sunlight_threshold: Optional[float] = None
     auto_mode: Optional[bool] = None
 
 
@@ -87,6 +90,7 @@ class ZoneOut(BaseModel):
     crop_preset_id: Optional[str] = None
     moisture_threshold_low: float
     moisture_threshold_high: float
+    sunlight_threshold: float
     auto_mode: bool
 
 
@@ -129,6 +133,8 @@ class SensorReadingIn(BaseModel):
     rain_detected: Optional[bool] = None            # rain sensor plate wet?
     rain_intensity: Optional[float] = Field(default=None, ge=0, le=100)  # optional 0-100 %
     sensor_fault: bool = False
+    pump_is_on: Optional[bool] = None
+    pump_source: Optional[str] = None
 
 
 class SensorReadingOut(BaseModel):
@@ -143,6 +149,10 @@ class SensorReadingOut(BaseModel):
     rain_detected: Optional[bool] = None
     rain_intensity: Optional[float] = None
     sensor_fault: bool
+
+    # Actual physical pump state reported by ESP32
+    pump_is_on: Optional[bool] = None
+    pump_source: Optional[str] = None
 
     @computed_field  # sunlight % derived from the LDR (light_level)
     @property

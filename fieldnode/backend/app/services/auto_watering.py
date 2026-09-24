@@ -1,26 +1,28 @@
 """
-Automatic soil-moisture-based watering.
+Automatic irrigation controller.
 
-Behavior:
-    AUTO MODE ON
-        ↓
-    Soil moisture < zone threshold
-        ↓
-    Start pump
-        ↓
-    Keep pump running while moisture < threshold
-        ↓
-    Soil moisture >= threshold
-        ↓
-    Stop pump
+AUTO MODE rules:
 
-Rain and sunlight are used as START conditions only.
+START:
+    soil moisture < zone.moisture_threshold_low
+    AND sunlight >= zone.sunlight_threshold
+    AND rain <= 50%
+    AND sensors are healthy/fresh
+    AND no command is already pending
 
-Once automatic watering has started, the pump continues until
-the soil moisture reaches the configured threshold.
+STOP:
+    pump is reported running AND ANY safety/target condition becomes true:
+        soil moisture >= zone.moisture_threshold_high
+        OR sunlight < zone.sunlight_threshold
+        OR rain > 50%
+        OR sensor data becomes invalid/stale
 
-There is NO cooldown between auto watering restarts because the
-pump may need to continue after an ESP32 safety timeout.
+IMPORTANT:
+    This service ONLY QUEUES commands for the ESP32.
+    It does NOT claim that the physical pump changed state.
+
+    device.pump_running must represent the ACTUAL physical pump state
+    reported by the ESP32 telemetry/acknowledgement endpoint.
 """
 
 import asyncio
@@ -32,7 +34,6 @@ from app.config import settings
 from app.database import SessionLocal
 from app.services.rain_sensor import get_rain_sensor_status
 from app.services.sunlight import sunlight_percent
-from app.services.ws_manager import manager
 
 
 logger = logging.getLogger("fieldnode.auto_watering")
@@ -49,7 +50,19 @@ if not logger.handlers:
     logger.propagate = False
 
 
+# ============================================================================
+# CONSTANTS
+# ============================================================================
+
+RAIN_STOP_THRESHOLD = 50.0
+
+
+# ============================================================================
+# HELPERS
+# ============================================================================
+
 def _latest_reading(db, device):
+    """Return the newest sensor reading for a device."""
     return (
         db.query(models.SensorReading)
         .filter(
@@ -62,279 +75,631 @@ def _latest_reading(db, device):
     )
 
 
-def _queue_start(db, device, zone, soil, sun_pct):
+def _get_sunlight_threshold(zone) -> float:
+    """Safely read and clamp the zone sunlight threshold."""
+    try:
+        value = float(zone.sunlight_threshold)
+    except (AttributeError, TypeError, ValueError):
+        value = 30.0
+
+    return max(0.0, min(100.0, value))
+
+
+def _get_rain_intensity(rain_status) -> float:
     """
-    Queue a pump START.
+    Extract rain intensity safely.
 
-    We use the ESP32 maximum allowed duration as a safety window.
-    The backend will keep checking moisture and re-issue START
-    if the ESP32 reaches its safety timeout before the soil
-    reaches the threshold.
+    Supports both:
+        rain_intensity
+    and:
+        intensity
     """
 
-    device.pending_command = "start"
+    if not rain_status:
+        return 0.0
 
-    # Use the configured auto duration if available.
-    # The ESP32 will enforce its own maximum safety limit.
+    value = rain_status.get("rain_intensity")
+
+    if value is None:
+        value = rain_status.get("intensity")
+
+    try:
+        return max(
+            0.0,
+            min(
+                100.0,
+                float(value or 0.0)
+            )
+        )
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _rain_is_blocking(rain_status) -> bool:
+    """
+    Rain protection rule.
+
+    IMPORTANT:
+    The ESP32 uses the same rule:
+
+        rain > 50% -> block/stop pump
+
+    We intentionally do NOT use a separate raining_now boolean here,
+    because that could make backend and ESP32 decisions disagree.
+    """
+
+    rain_intensity = _get_rain_intensity(
+        rain_status
+    )
+
+    return (
+        rain_intensity >
+        RAIN_STOP_THRESHOLD
+    )
+
+
+# ============================================================================
+# QUEUE START
+# ============================================================================
+
+def _queue_start(
+    db,
+    device,
+    zone,
+    soil,
+    sun_pct,
+):
+    """
+    Queue START command for ESP32.
+
+    IMPORTANT:
+    This does NOT set device.pump_running=True.
+
+    The ESP32 must receive the command, activate the relay,
+    and then report the actual physical pump state.
+    """
+
+    # Never overwrite another pending command.
+    if device.pending_command:
+        logger.info(
+            "zone '%s' (%s): START not queued -- "
+            "existing command=%s",
+            zone.name,
+            zone.id,
+            device.pending_command,
+        )
+        return False
+
     duration = getattr(
         settings,
         "AUTO_WATER_RUN_SECONDS",
         300,
     )
 
+    try:
+        duration = int(duration)
+    except (TypeError, ValueError):
+        duration = 300
+
     if duration <= 0:
         duration = 300
 
-    if duration > 300:
-        duration = 300
+    # ESP32 maximum safety limit.
+    duration = min(
+        duration,
+        300
+    )
 
+    device.pending_command = "start"
     device.pending_command_duration = duration
+    device.pending_command_source = "auto"
 
     db.commit()
 
     logger.info(
-        "zone '%s' (%s): QUEUED START -- soil %.1f%% < threshold %.1f%%, "
-        "sunlight %.1f%%, duration %ss",
+        "zone '%s' (%s): QUEUED START -- "
+        "soil %.1f%% < low %.1f%%, "
+        "sunlight %.1f%% >= required %.1f%%, "
+        "rain <= %.1f%%, "
+        "duration=%ss",
         zone.name,
         zone.id,
         soil,
-        zone.moisture_threshold_low,
+        float(zone.moisture_threshold_low),
         sun_pct,
+        _get_sunlight_threshold(zone),
+        RAIN_STOP_THRESHOLD,
         duration,
     )
 
     return True
 
 
-def _queue_stop(db, device, zone, soil):
+# ============================================================================
+# QUEUE STOP
+# ============================================================================
+
+def _queue_stop(
+    db,
+    device,
+    zone,
+    soil,
+    reason,
+):
     """
-    Queue STOP when the soil has reached the target threshold.
+    Queue STOP command for ESP32.
+
+    IMPORTANT:
+    This does NOT set device.pump_running=False.
+
+    The ESP32 must physically stop the relay and then report
+    the actual state.
     """
+
+    # Stop already waiting.
+    if device.pending_command == "stop":
+        logger.info(
+            "zone '%s' (%s): STOP already queued",
+            zone.name,
+            zone.id,
+        )
+        return False
+
+    # If START is waiting but conditions have become unsafe,
+    # replace START with STOP.
+    if device.pending_command == "start":
+        logger.warning(
+            "zone '%s' (%s): replacing pending START with STOP -- %s",
+            zone.name,
+            zone.id,
+            reason,
+        )
 
     device.pending_command = "stop"
-
-    # Stop command does not need a duration.
     device.pending_command_duration = 0
+    device.pending_command_source = "auto"
 
     db.commit()
 
-    logger.info(
-        "zone '%s' (%s): QUEUED STOP -- soil %.1f%% >= threshold %.1f%%",
+    logger.warning(
+        "zone '%s' (%s): QUEUED STOP -- "
+        "soil=%.1f%%, reason=%s",
         zone.name,
         zone.id,
         soil,
-        zone.moisture_threshold_low,
+        reason,
     )
 
     return True
 
 
+# ============================================================================
+# MAIN DECISION ENGINE
+# ============================================================================
+
 def _check_zone(db, zone) -> str:
     """
+    Evaluate one AUTO MODE zone.
+
+    START:
+
+        soil < low
+        AND sunlight >= threshold
+        AND rain <= 50%
+
+    STOP:
+
+        pump is running
+        AND (
+            soil >= high
+            OR sunlight < threshold
+            OR rain > 50%
+            OR sensor invalid/stale
+        )
+
     Returns:
-        "start" -> start command queued
-        "stop"  -> stop command queued
-        "none"  -> nothing changed
+
+        "start" -> START command queued
+        "stop"  -> STOP command queued
+        "none"  -> no command required
     """
 
-    tag = f"zone '{zone.name}' ({zone.id})"
+    tag = (
+        f"zone '{zone.name}' ({zone.id})"
+    )
 
-    # ------------------------------------------------------------
+    # ========================================================================
     # 1. AUTO MODE
-    # ------------------------------------------------------------
+    # ========================================================================
 
     if not zone.auto_mode:
+
         logger.info(
-            "%s: skipped -- auto_mode is off",
+            "%s: skipped -- auto_mode is OFF",
             tag,
         )
+
         return "none"
 
-    # ------------------------------------------------------------
+    # ========================================================================
     # 2. DEVICE
-    # ------------------------------------------------------------
+    # ========================================================================
 
     if not zone.devices:
-        logger.info(
+
+        logger.warning(
             "%s: skipped -- no registered device",
             tag,
         )
+
         return "none"
 
     device = zone.devices[0]
 
-    # ------------------------------------------------------------
+    # ========================================================================
     # 3. LATEST SENSOR READING
-    # ------------------------------------------------------------
+    # ========================================================================
 
-    latest = _latest_reading(db, device)
+    latest = _latest_reading(
+        db,
+        device
+    )
 
     if latest is None:
-        logger.info(
+
+        logger.warning(
             "%s: skipped -- no sensor readings",
             tag,
         )
+
         return "none"
 
-    if latest.soil_moisture is None:
-        logger.info(
-            "%s: skipped -- soil_moisture is null",
-            tag,
-        )
-        return "none"
+    # ========================================================================
+    # 4. SENSOR FAULT
+    # ========================================================================
 
     if latest.sensor_fault:
-        logger.info(
-            "%s: skipped -- sensor_fault=true",
+
+        logger.warning(
+            "%s: sensor_fault=true",
             tag,
         )
+
+        # Fail safe if physical pump is reported running.
+        if device.pump_running:
+
+            if _queue_stop(
+                db,
+                device,
+                zone,
+                float(
+                    latest.soil_moisture or 0.0
+                ),
+                "Sensor fault",
+            ):
+                return "stop"
+
         return "none"
 
-    # ------------------------------------------------------------
-    # 4. SENSOR FRESHNESS
-    # ------------------------------------------------------------
+    # ========================================================================
+    # 5. SOIL DATA VALIDATION
+    # ========================================================================
+
+    if latest.soil_moisture is None:
+
+        logger.warning(
+            "%s: soil moisture unavailable",
+            tag,
+        )
+
+        # If pump is running and soil data disappears,
+        # fail safe.
+        if device.pump_running:
+
+            if _queue_stop(
+                db,
+                device,
+                zone,
+                0.0,
+                "Soil moisture unavailable",
+            ):
+                return "stop"
+
+        return "none"
+
+    # ========================================================================
+    # 6. SENSOR FRESHNESS
+    # ========================================================================
 
     age = (
-        datetime.utcnow() - latest.timestamp
+        datetime.utcnow() -
+        latest.timestamp
     ).total_seconds()
 
     if age > settings.READING_STALE_SECONDS:
-        logger.info(
-            "%s: skipped -- reading %.0fs old > %ss",
+
+        logger.warning(
+            "%s: sensor data stale -- "
+            "%.0fs > %ss",
             tag,
             age,
             settings.READING_STALE_SECONDS,
         )
+
+        if device.pump_running:
+
+            if _queue_stop(
+                db,
+                device,
+                zone,
+                float(
+                    latest.soil_moisture
+                ),
+                "Stale sensor data",
+            ):
+                return "stop"
+
         return "none"
 
-    soil = float(latest.soil_moisture)
+    # ========================================================================
+    # 7. CURRENT VALUES
+    # ========================================================================
 
-    threshold = float(
+    soil = float(
+        latest.soil_moisture
+    )
+
+    low_threshold = float(
         zone.moisture_threshold_low
     )
 
-    # ------------------------------------------------------------
-    # 5. PUMP ALREADY RUNNING
-    # ------------------------------------------------------------
+    high_threshold = float(
+        zone.moisture_threshold_high
+    )
 
-    if device.pump_running:
+    sunlight_threshold = (
+        _get_sunlight_threshold(zone)
+    )
 
-        # If target moisture reached:
-        # STOP the pump.
-        if soil >= threshold:
+    # IMPORTANT:
+    # sunlight_percent() must match the ESP32's lightPct calculation.
+    sun_pct = sunlight_percent(
+        latest.light_level
+    )
 
-            if device.pending_command:
-                logger.info(
-                    "%s: pump running but command already queued (%s)",
-                    tag,
-                    device.pending_command,
-                )
-                return "none"
+    # ========================================================================
+    # 8. SUNLIGHT VALIDATION
+    # ========================================================================
 
-            return (
-                "stop"
-                if _queue_stop(
-                    db,
-                    device,
-                    zone,
-                    soil,
-                )
-                else "none"
-            )
+    if sun_pct is None:
 
-        # Soil is still below threshold.
-        # DO NOT stop/restart.
-        logger.info(
-            "%s: pump already running -- soil %.1f%% < threshold %.1f%%, continuing",
+        logger.warning(
+            "%s: sunlight unavailable",
             tag,
-            soil,
-            threshold,
         )
+
+        # Never allow a running AUTO pump to continue
+        # when sunlight information disappears.
+        if device.pump_running:
+
+            if _queue_stop(
+                db,
+                device,
+                zone,
+                soil,
+                "Sunlight unavailable",
+            ):
+                return "stop"
 
         return "none"
 
-    # ------------------------------------------------------------
-    # 6. PUMP NOT RUNNING
-    # ------------------------------------------------------------
+    sun_pct = float(
+        sun_pct
+    )
 
-    # If soil has already reached the threshold,
-    # nothing needs to happen.
-    if soil >= threshold:
-        logger.info(
-            "%s: soil %.1f%% >= threshold %.1f%% -- watering not needed",
-            tag,
-            soil,
-            threshold,
-        )
-        return "none"
-
-    # ------------------------------------------------------------
-    # 7. COMMAND ALREADY QUEUED
-    # ------------------------------------------------------------
-
-    if device.pending_command:
-
-        logger.info(
-            "%s: skipped -- command already queued (%s)",
-            tag,
-            device.pending_command,
-        )
-
-        return "none"
-
-    # ------------------------------------------------------------
-    # 8. RAIN CHECK
-    #
-    # Rain is a START blocker.
-    # Once the pump is already running, rain does not stop it.
-    # ------------------------------------------------------------
+    # ========================================================================
+    # 9. RAIN STATUS
+    # ========================================================================
 
     rain_status = get_rain_sensor_status(
         db,
         device,
     )
 
-    if rain_status["raining_now"]:
-
-        logger.info(
-            "%s: skipped -- rain detected (%s)",
-            tag,
-            rain_status["status"],
-        )
-
-        return "none"
-
-    # ------------------------------------------------------------
-    # 9. SUNLIGHT CHECK
-    #
-    # Only used before starting a new watering cycle.
-    # ------------------------------------------------------------
-
-    sun_pct = sunlight_percent(
-        latest.light_level
+    rain_intensity = _get_rain_intensity(
+        rain_status
     )
 
-    if sun_pct is None:
+    rain_blocked = _rain_is_blocking(
+        rain_status
+    )
+
+    # ========================================================================
+    # 10. PUMP CURRENTLY RUNNING
+    # ========================================================================
+
+    if device.pump_running:
+
+        # --------------------------------------------------------------------
+        # SAFETY STOP: RAIN
+        # --------------------------------------------------------------------
+
+        if rain_blocked:
+
+            reason = (
+                f"Rain protection "
+                f"(rain={rain_intensity:.1f}%)"
+            )
+
+            if device.pending_command == "stop":
+
+                logger.info(
+                    "%s: STOP already pending -- %s",
+                    tag,
+                    reason,
+                )
+
+                return "none"
+
+            if _queue_stop(
+                db,
+                device,
+                zone,
+                soil,
+                reason,
+            ):
+                return "stop"
+
+            return "none"
+
+        # --------------------------------------------------------------------
+        # SAFETY STOP: LOW SUNLIGHT
+        # --------------------------------------------------------------------
+
+        if sun_pct < sunlight_threshold:
+
+            reason = (
+                f"Insufficient sunlight "
+                f"({sun_pct:.1f}% < "
+                f"{sunlight_threshold:.1f}%)"
+            )
+
+            if device.pending_command == "stop":
+
+                logger.info(
+                    "%s: STOP already pending -- %s",
+                    tag,
+                    reason,
+                )
+
+                return "none"
+
+            if _queue_stop(
+                db,
+                device,
+                zone,
+                soil,
+                reason,
+            ):
+                return "stop"
+
+            return "none"
+
+        # --------------------------------------------------------------------
+        # TARGET MOISTURE REACHED
+        # --------------------------------------------------------------------
+
+        if soil >= high_threshold:
+
+            reason = (
+                f"Target moisture reached "
+                f"({soil:.1f}% >= "
+                f"{high_threshold:.1f}%)"
+            )
+
+            if device.pending_command == "stop":
+
+                logger.info(
+                    "%s: STOP already pending -- %s",
+                    tag,
+                    reason,
+                )
+
+                return "none"
+
+            if _queue_stop(
+                db,
+                device,
+                zone,
+                soil,
+                reason,
+            ):
+                return "stop"
+
+            return "none"
+
+        # --------------------------------------------------------------------
+        # CONTINUE PUMP
+        # --------------------------------------------------------------------
+
         logger.info(
-            "%s: skipped -- sunlight unavailable",
+            "%s: pump running -- "
+            "soil=%.1f%%, "
+            "sunlight=%.1f%%, "
+            "rain=%.1f%%",
             tag,
+            soil,
+            sun_pct,
+            rain_intensity,
         )
+
         return "none"
 
-    if sun_pct < settings.AUTO_WATER_MIN_SUNLIGHT_PCT:
+    # ========================================================================
+    # 11. PUMP NOT RUNNING
+    # ========================================================================
+
+    # Never issue START while STOP is still pending.
+    if device.pending_command == "stop":
 
         logger.info(
-            "%s: skipped -- sunlight %.1f%% < required %.1f%%",
+            "%s: skipped -- STOP command pending",
+            tag,
+        )
+
+        return "none"
+
+    # ========================================================================
+    # 12. SOIL ALREADY SUFFICIENT
+    # ========================================================================
+
+    if soil >= low_threshold:
+
+        logger.info(
+            "%s: no watering required -- "
+            "soil %.1f%% >= low threshold %.1f%%",
+            tag,
+            soil,
+            low_threshold,
+        )
+
+        return "none"
+
+    # ========================================================================
+    # 13. RAIN BLOCKS START
+    # ========================================================================
+
+    if rain_blocked:
+
+        logger.info(
+            "%s: START blocked -- "
+            "rain=%.1f%% > %.1f%%",
+            tag,
+            rain_intensity,
+            RAIN_STOP_THRESHOLD,
+        )
+
+        return "none"
+
+    # ========================================================================
+    # 14. SUNLIGHT BLOCKS START
+    # ========================================================================
+
+    if sun_pct < sunlight_threshold:
+
+        logger.info(
+            "%s: START blocked -- "
+            "sunlight %.1f%% < required %.1f%%",
             tag,
             sun_pct,
-            settings.AUTO_WATER_MIN_SUNLIGHT_PCT,
+            sunlight_threshold,
         )
 
         return "none"
 
-    # ------------------------------------------------------------
-    # 10. START PUMP
-    # ------------------------------------------------------------
+    # ========================================================================
+    # 15. START
+    # ========================================================================
 
     if _queue_start(
         db,
@@ -347,6 +712,10 @@ def _check_zone(db, zone) -> str:
 
     return "none"
 
+
+# ============================================================================
+# ONE AUTO-WATERING PASS
+# ============================================================================
 
 async def _run_pass() -> None:
 
@@ -364,8 +733,9 @@ async def _run_pass() -> None:
 
         if not zones:
 
-            logger.info(
-                "Pass complete: no auto-mode zones"
+            logger.debug(
+                "Auto-watering pass: "
+                "no auto-mode zones"
             )
 
             return
@@ -384,73 +754,26 @@ async def _run_pass() -> None:
 
                 device = zone.devices[0]
 
-                # ------------------------------------------------
-                # Broadcast START
-                # ------------------------------------------------
+                # IMPORTANT:
+                #
+                # We ONLY queued the command.
+                #
+                # We do NOT modify:
+                #
+                #     device.pump_running
+                #
+                # The ESP32 must physically execute the command
+                # and then report its actual relay/pump state.
 
-                if action == "start":
-
-                    await manager.broadcast(
-                        zone.id,
-                        {
-                            "event":
-                                "pump_command_queued",
-
-                            "action":
-                                "start",
-
-                            "source":
-                                "auto",
-                        },
-                    )
-
-                    await manager.broadcast(
-                        zone.id,
-                        {
-                            "event":
-                                "pump_state",
-
-                            "pump_running":
-                                True,
-
-                            "device_id":
-                                device.id,
-                        },
-                    )
-
-                # ------------------------------------------------
-                # Broadcast STOP
-                # ------------------------------------------------
-
-                elif action == "stop":
-
-                    await manager.broadcast(
-                        zone.id,
-                        {
-                            "event":
-                                "pump_command_queued",
-
-                            "action":
-                                "stop",
-
-                            "source":
-                                "auto",
-                        },
-                    )
-
-                    await manager.broadcast(
-                        zone.id,
-                        {
-                            "event":
-                                "pump_state",
-
-                            "pump_running":
-                                False,
-
-                            "device_id":
-                                device.id,
-                        },
-                    )
+                logger.info(
+                    "zone '%s' (%s): "
+                    "auto action=%s queued "
+                    "for device=%s",
+                    zone.name,
+                    zone.id,
+                    action,
+                    device.id,
+                )
 
             except Exception:
 
@@ -464,24 +787,29 @@ async def _run_pass() -> None:
         db.close()
 
 
+# ============================================================================
+# CONTINUOUS BACKGROUND LOOP
+# ============================================================================
+
 async def auto_watering_loop() -> None:
     """
-    Runs continuously in the background.
+    Continuously evaluate all auto-mode zones.
 
-    The loop checks the latest soil moisture periodically.
+    Every pass checks:
 
-    If moisture is below threshold:
-        START / CONTINUE watering.
-
-    If moisture reaches threshold:
-        STOP watering.
+        - soil moisture
+        - sunlight
+        - rain
+        - sensor health
+        - sensor freshness
+        - actual reported pump state
+        - pending commands
     """
 
     logger.info(
         "Auto-watering loop started "
-        "(interval=%ss, sunlight minimum=%.1f%%)",
+        "(interval=%ss)",
         settings.AUTO_WATER_CHECK_INTERVAL_SECONDS,
-        settings.AUTO_WATER_MIN_SUNLIGHT_PCT,
     )
 
     while True:

@@ -805,11 +805,18 @@ export default function Home() {
                           <small>LDR reading</small>
                         </div>
                         <b>
-                          {latest?.sunlight_pct != null ? latest.sunlight_pct.toFixed(0) : "—"}
+                          {overview?.sunlight_pct != null
+                            ? overview.sunlight_pct.toFixed(0)
+                            : "—"}
                           <small>%</small>
                         </b>
+
                         <span className="signal-line">
-                          <i style={{ width: `${latest?.sunlight_pct ?? 0}%` }} />
+                          <i
+                            style={{
+                              width: `${overview?.sunlight_pct ?? 0}%`,
+                            }}
+                          />
                         </span>
                       </div>
                       <div className="signal-row">

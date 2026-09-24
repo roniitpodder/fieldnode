@@ -14,6 +14,7 @@ class CropPresetIn(BaseModel):
     crop_name: str
     moisture_min: float
     moisture_max: float
+    sunlight_threshold: float = 30.0
     notes: Optional[str] = None
 
 

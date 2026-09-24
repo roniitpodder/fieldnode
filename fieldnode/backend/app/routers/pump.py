@@ -10,14 +10,24 @@ from app.deps import get_current_user, get_device_from_api_key
 from app.services.ownership import get_owned_zone_or_404
 from app.services.ws_manager import manager
 
-router = APIRouter(prefix="/api/pump", tags=["pump"])
 
+router = APIRouter(
+    prefix="/api/pump",
+    tags=["pump"],
+)
+
+
+# ============================================================
+# HELPERS
+# ============================================================
 
 def estimate_liters(
     duration_seconds: int,
     flow_rate_lpm: float,
 ) -> float:
-    """Estimate delivered water using calibrated pump flow rate."""
+    """
+    Estimate delivered water using the calibrated pump flow rate.
+    """
 
     rate = (
         flow_rate_lpm
@@ -29,6 +39,26 @@ def estimate_liters(
         max(0, duration_seconds) / 60.0 * rate,
         2,
     )
+
+
+def validate_duration(duration: int) -> int:
+    """
+    Validate pump duration against backend safety limits.
+    """
+
+    if (
+        duration < 1
+        or duration > settings.MAX_PUMP_RUN_SECONDS
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"duration_seconds must be between "
+                f"1 and {settings.MAX_PUMP_RUN_SECONDS}."
+            ),
+        )
+
+    return duration
 
 
 # ============================================================
@@ -44,6 +74,16 @@ async def control_pump(
     db: Session = Depends(get_db),
     user: models.User = Depends(get_current_user),
 ):
+    """
+    Dashboard/manual pump control.
+
+    IMPORTANT:
+    This endpoint only QUEUES a command for the ESP32.
+
+    It does NOT set device.pump_running=True because the backend
+    has not yet confirmed that the physical relay actually turned on.
+    """
+
     zone = get_owned_zone_or_404(
         db,
         payload.zone_id,
@@ -70,22 +110,19 @@ async def control_pump(
             else 30
         )
 
-        if (
-            duration < 1
-            or duration > settings.MAX_PUMP_RUN_SECONDS
-        ):
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    f"duration_seconds must be between "
-                    f"1 and {settings.MAX_PUMP_RUN_SECONDS}."
-                ),
-            )
+        duration = validate_duration(duration)
 
+        # Queue command for ESP32.
         device.pending_command = "start"
         device.pending_command_duration = duration
 
-        reason = "Manual start requested from dashboard."
+        # IMPORTANT:
+        # This tells ESP32 that this is a MANUAL command.
+        device.pending_command_source = "manual"
+
+        reason = (
+            "Manual start requested from dashboard."
+        )
 
         event = models.WateringEvent(
             zone_id=zone.id,
@@ -96,16 +133,25 @@ async def control_pump(
             reason=reason,
         )
 
+        source = "manual"
+
     # --------------------------------------------------------
     # STOP
     # --------------------------------------------------------
 
     elif payload.action == "stop":
 
+        # Queue stop command for ESP32.
         device.pending_command = "stop"
         device.pending_command_duration = None
 
-        reason = "Manual stop requested from dashboard."
+        # IMPORTANT:
+        # Stop command is also manual when it comes from dashboard.
+        device.pending_command_source = "manual"
+
+        reason = (
+            "Manual stop requested from dashboard."
+        )
 
         event = models.WateringEvent(
             zone_id=zone.id,
@@ -116,22 +162,38 @@ async def control_pump(
             reason=reason,
         )
 
+        source = "manual"
+
+    # --------------------------------------------------------
+    # INVALID ACTION
+    # --------------------------------------------------------
+
     else:
+
         raise HTTPException(
             status_code=400,
             detail="action must be 'start' or 'stop'",
         )
 
+    # --------------------------------------------------------
+    # SAVE
+    # --------------------------------------------------------
+
     db.add(event)
     db.commit()
     db.refresh(event)
+
+    # --------------------------------------------------------
+    # WEBSOCKET
+    # --------------------------------------------------------
 
     await manager.broadcast(
         device.zone_id,
         {
             "event": "pump_command_queued",
             "action": payload.action,
-            "source": "manual",
+            "source": source,
+            "mode": source,
         },
     )
 
@@ -147,28 +209,84 @@ async def poll_command(
     db: Session = Depends(get_db),
     device: models.Device = Depends(get_device_from_api_key),
 ):
+    """
+    ESP32 polls this endpoint for a pending command.
+
+    IMPORTANT:
+    Receiving a command does NOT mean the physical pump is ON.
+
+    Therefore device.pump_running is intentionally NOT modified here.
+    """
+
+    # --------------------------------------------------------
+    # HEARTBEAT
+    # --------------------------------------------------------
+
     device.last_seen = datetime.utcnow()
+
+    # --------------------------------------------------------
+    # READ PENDING COMMAND
+    # --------------------------------------------------------
 
     command = device.pending_command
     duration = device.pending_command_duration
-    
-    # Determine custom SMS text based on command
+
+    # New field added to Device model.
+    source = (
+        device.pending_command_source
+        or "manual"
+    )
+
+    # Normalize source.
+    if source not in ("auto", "manual"):
+        source = "manual"
+
+    # --------------------------------------------------------
+    # SMS MESSAGE
+    # --------------------------------------------------------
+
     sms_text = None
+
     if command == "start":
-        device.pump_running = True
-        sms_text = f"SU-Krishi: Pump STARTED via Dashboard for {duration}s."
+
+        sms_text = (
+            f"SU-Krishi: Pump START command sent "
+            f"for {duration}s ({source})."
+        )
+
     elif command == "stop":
-        device.pump_running = False
-        sms_text = "SU-Krishi: Pump STOPPED via Dashboard."
+
+        sms_text = (
+            f"SU-Krishi: Pump STOP command sent "
+            f"({source})."
+        )
+
+    # --------------------------------------------------------
+    # CLEAR COMMAND
+    # --------------------------------------------------------
+    #
+    # We clear it because ESP32 has received it.
+    #
+    # We DO NOT set pump_running=True here.
+    #
+    # Physical pump state should come from ESP32 telemetry.
+    # --------------------------------------------------------
 
     device.pending_command = None
     device.pending_command_duration = None
+    device.pending_command_source = None
+
     db.commit()
+
+    # --------------------------------------------------------
+    # RESPONSE TO ESP32
+    # --------------------------------------------------------
 
     return {
         "command": command,
         "duration_seconds": duration,
-        "sms_alert": sms_text,  # <--- ESP32 reads this and sends SMS via SIM800L
+        "mode": source,
+        "sms_alert": sms_text,
     }
 
 
@@ -183,12 +301,42 @@ async def ack_command(
     device: models.Device = Depends(get_device_from_api_key),
 ):
     """
-    ESP32 calls this after the pump cycle has finished.
-    Updates last_seen heartbeat.
+    ESP32 calls this after a pump cycle has finished.
+
+    This endpoint:
+    - updates device heartbeat
+    - marks pump as OFF
+    - calculates estimated water usage
+    - completes the corresponding watering event
     """
 
+    # --------------------------------------------------------
+    # VALIDATE DURATION
+    # --------------------------------------------------------
+
+    if duration_seconds < 0:
+        duration_seconds = 0
+
+    if (
+        duration_seconds >
+        settings.MAX_PUMP_RUN_SECONDS
+    ):
+        duration_seconds = (
+            settings.MAX_PUMP_RUN_SECONDS
+        )
+
+    # --------------------------------------------------------
+    # HEARTBEAT / PHYSICAL STATE
+    # --------------------------------------------------------
+
     device.last_seen = datetime.utcnow()
+
+    # ESP32 is telling us the cycle has finished.
     device.pump_running = False
+
+    # --------------------------------------------------------
+    # WATER ESTIMATION
+    # --------------------------------------------------------
 
     liters = estimate_liters(
         duration_seconds,
@@ -196,17 +344,26 @@ async def ack_command(
     )
 
     # --------------------------------------------------------
-    # Find the most recent unfinished watering event.
+    # FIND MOST RECENT UNFINISHED EVENT
     # --------------------------------------------------------
 
     pending_event = (
         db.query(models.WateringEvent)
         .filter(
             models.WateringEvent.device_id == device.id,
+
+            # Event has not yet been completed.
             models.WateringEvent.amount_liters == 0,
+
+            # Ignore manual STOP events.
             models.WateringEvent.duration_seconds > 0,
+
+            # Avoid matching very old events.
             models.WateringEvent.timestamp
-            >= datetime.utcnow() - timedelta(hours=1),
+            >= (
+                datetime.utcnow()
+                - timedelta(hours=1)
+            ),
         )
         .order_by(
             models.WateringEvent.timestamp.desc()
@@ -214,12 +371,21 @@ async def ack_command(
         .first()
     )
 
+    # --------------------------------------------------------
+    # COMPLETE EXISTING EVENT
+    # --------------------------------------------------------
+
     if pending_event:
 
         pending_event.amount_liters = liters
-        pending_event.duration_seconds = duration_seconds
+        pending_event.duration_seconds = (
+            duration_seconds
+        )
 
-        if pending_event.trigger_type == models.TriggerType.AUTO:
+        if (
+            pending_event.trigger_type
+            == models.TriggerType.AUTO
+        ):
 
             pending_event.reason = (
                 f"Automatic watering completed: "
@@ -235,7 +401,17 @@ async def ack_command(
                 f"(~{liters:.2f} L estimated)."
             )
 
+    # --------------------------------------------------------
+    # NO MATCHING EVENT
+    # --------------------------------------------------------
+
     else:
+
+        # This can happen if the pump was started locally
+        # or if the original event is no longer available.
+        #
+        # We create a fallback event so the physical
+        # watering cycle is still recorded.
 
         db.add(
             models.WateringEvent(
@@ -245,14 +421,23 @@ async def ack_command(
                 amount_liters=liters,
                 duration_seconds=duration_seconds,
                 reason=(
-                    f"Automatic watering completed: "
+                    f"Watering completed without a "
+                    f"matching queued event: "
                     f"pump ran {duration_seconds}s "
                     f"(~{liters:.2f} L estimated)."
                 ),
             )
         )
 
+    # --------------------------------------------------------
+    # SAVE
+    # --------------------------------------------------------
+
     db.commit()
+
+    # --------------------------------------------------------
+    # WEBSOCKET
+    # --------------------------------------------------------
 
     await manager.broadcast(
         device.zone_id,
@@ -283,12 +468,32 @@ def list_events(
     db: Session = Depends(get_db),
     user: models.User = Depends(get_current_user),
 ):
+    """
+    Return recent watering events for an owned zone.
+    """
+
+    # --------------------------------------------------------
+    # OWNERSHIP CHECK
+    # --------------------------------------------------------
 
     get_owned_zone_or_404(
         db,
         zone_id,
         user,
     )
+
+    # --------------------------------------------------------
+    # LIMIT SAFETY
+    # --------------------------------------------------------
+
+    limit = max(
+        1,
+        min(limit, 200),
+    )
+
+    # --------------------------------------------------------
+    # QUERY
+    # --------------------------------------------------------
 
     events = (
         db.query(models.WateringEvent)
