@@ -1,0 +1,94 @@
+from datetime import datetime, timedelta, date
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.orm import Session
+
+from app import models, schemas
+from app.database import get_db
+from app.deps import get_current_user
+from app.services.ownership import get_owned_zone_or_404
+from app.services.field_health import compute_field_health
+from app.services.water_savings import water_used_today, savings_vs_fixed_schedule_pct
+from app.services.rain import get_rain_forecast
+from app.services.rain_sensor import get_rain_sensor_status
+from app.services.sunlight import sunlight_percent
+from app.config import settings
+
+router = APIRouter(prefix="/api/overview", tags=["overview"])
+
+
+@router.get("/zones/{zone_id}", response_model=schemas.LiveFieldStatus)
+def zone_overview(zone_id: str, db: Session = Depends(get_db),
+                   user: models.User = Depends(get_current_user)):
+    zone = get_owned_zone_or_404(db, zone_id, user)
+    farm = db.query(models.Farm).filter(models.Farm.id == zone.farm_id).first()
+    device = zone.devices[0] if zone.devices else None
+
+    latest = None
+    yesterday_latest = None
+    if device:
+        latest = (
+            db.query(models.SensorReading)
+            .filter(models.SensorReading.device_id == device.id)
+            .order_by(models.SensorReading.timestamp.desc())
+            .first()
+        )
+        yesterday = datetime.utcnow() - timedelta(days=1)
+        yesterday_latest = (
+            db.query(models.SensorReading)
+            .filter(models.SensorReading.device_id == device.id,
+                    models.SensorReading.timestamp <= yesterday)
+            .order_by(models.SensorReading.timestamp.desc())
+            .first()
+        )
+
+    moisture_delta = None
+    if latest and yesterday_latest and latest.soil_moisture is not None and yesterday_latest.soil_moisture is not None:
+        moisture_delta = round(latest.soil_moisture - yesterday_latest.soil_moisture, 1)
+
+    health = compute_field_health(db, zone)
+    used_today = water_used_today(db, zone.id)
+    savings_pct = savings_vs_fixed_schedule_pct(used_today)
+
+    forecast = get_rain_forecast(
+        zone.id, date.today() + timedelta(days=1),
+        latitude=farm.latitude if farm else None,
+        longitude=farm.longitude if farm else None,
+    )
+    rain_probability = forecast.probability
+    rain_sensor = get_rain_sensor_status(db, device)
+    raining_now = rain_sensor["raining_now"]
+    # Protection is on if the plate is wet right now OR a high-probability forecast is coming.
+    rain_protection_on = raining_now or (rain_probability is not None and rain_probability >= 65)
+
+    is_online = bool(
+        device and device.last_seen
+        and (datetime.utcnow() - device.last_seen).total_seconds() < settings.DEVICE_OFFLINE_AFTER_SECONDS
+    )
+
+    feels_like = None
+    if latest and latest.temperature is not None and latest.humidity is not None:
+        # simple heat-index-style nudge, not a full formula — good enough for a UI hint
+        feels_like = round(latest.temperature + max(0, (latest.humidity - 50) * 0.02), 1)
+
+    return schemas.LiveFieldStatus(
+        zone_id=zone.id,
+        zone_name=zone.name,
+        soil_moisture=latest.soil_moisture if latest else None,
+        soil_moisture_delta_vs_yesterday=moisture_delta,
+        temperature=latest.temperature if latest else None,
+        feels_like=feels_like,
+        sunlight_pct=sunlight_percent(latest.light_level) if latest else None,
+        water_used_today_liters=used_today,
+        water_used_delta_vs_fixed_schedule_pct=savings_pct,
+        field_health_score=health["score"],
+        sensors_reporting_pct=health["sensors_reporting_pct"],
+        device_online=is_online,
+        rain_protection_on=rain_protection_on,
+        rain_probability=rain_probability,
+        raining_now=raining_now,
+        rain_sensor_status=rain_sensor["status"],
+        rain_forecast_source=forecast.source,
+        next_cycle_skipped=rain_protection_on,
+        pump_running=device.pump_running if device else False,
+        auto_mode=zone.auto_mode,
+    )
