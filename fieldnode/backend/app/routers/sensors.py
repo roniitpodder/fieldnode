@@ -37,8 +37,7 @@ async def ingest_reading(
     pump_source = data.pop("pump_source", None)
 
     # ---------------------------------------------------------
-    # Create database SensorReading using ONLY fields that
-    # actually belong to the SensorReading SQLAlchemy model.
+    # Create database SensorReading
     # ---------------------------------------------------------
     reading = models.SensorReading(
         device_id=device.id,
@@ -52,7 +51,6 @@ async def ingest_reading(
     # PHYSICAL PUMP STATE
     # ---------------------------------------------------------
 
-    # Track whether the physical pump state actually changed.
     pump_state_changed = False
 
     if pump_is_on is not None:
@@ -84,37 +82,42 @@ async def ingest_reading(
     # IMMEDIATE AUTO-WATERING EVALUATION
     # ---------------------------------------------------------
     #
-    # Previously, auto-watering depended only on the periodic
-    # auto_watering_loop. This meant live ESP32 telemetry could
-    # take up to ~60 seconds to trigger a decision.
+    # Run the decision engine in a background thread.
     #
-    # Now the decision engine is evaluated immediately after
-    # every committed sensor reading.
+    # IMPORTANT:
+    # Do NOT use the request's SQLAlchemy `db` session here.
+    # The background task gets its own SessionLocal() session.
     #
+    # This prevents the ESP32 telemetry HTTP request from being
+    # blocked while evaluate_zone_now() performs its work.
     # ---------------------------------------------------------
 
     try:
+        import asyncio
 
         from app.services.auto_watering import evaluate_zone_now
+        from app.database import SessionLocal
 
-        evaluate_zone_now(
-            db,
-            device.zone_id,
+        asyncio.create_task(
+            asyncio.to_thread(
+                evaluate_zone_now,
+                SessionLocal(),
+                device.zone_id,
+            )
         )
 
     except Exception as exc:
 
-        # Do not let an auto-watering evaluation failure
-        # break the ESP32 telemetry endpoint.
+        # Never let background scheduling failure break
+        # the live ESP32 telemetry endpoint.
         print(
-            f"[AUTO-WATERING] Immediate evaluation failed: {exc}"
+            f"[AUTO-WATERING] Background evaluation scheduling failed: {exc}"
         )
 
     # ---------------------------------------------------------
     # PHYSICAL PUMP STATE BROADCAST
     # ---------------------------------------------------------
 
-    # If physical pump state changed, broadcast immediately.
     if pump_state_changed:
 
         await manager.broadcast(
